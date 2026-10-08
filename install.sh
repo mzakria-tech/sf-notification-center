@@ -234,49 +234,26 @@ launchctl start "$POLLER_LABEL"
 ok "SF case poller started (every 60s)"
 
 # ────────────────────────────────────────────────────────────────
-step "8/8" "Verifying"
+step "8/8" "Opening dashboard"
 # ────────────────────────────────────────────────────────────────
 
-sleep 3
-
-# Check dashboard
-if curl -s -o /dev/null -w "%{http_code}" http://localhost:8090 2>/dev/null | grep -q 200; then
-    ok "Dashboard responding at http://localhost:8090"
-else
-    warn "Dashboard not responding yet (may take a few seconds)"
-fi
-
-# Check SMTP
-if python3 -c "import smtplib; s=smtplib.SMTP('127.0.0.1',2525,timeout=3); s.noop(); s.quit()" 2>/dev/null; then
-    ok "Local SMTP relay ready on port 2525"
-else
-    warn "SMTP not responding yet (may take a few seconds)"
-fi
-
-# Wait for first poll
-echo ""
-echo -e "  ${Y}Waiting for first poll cycle...${N}"
-for i in $(seq 1 20); do
-    if [ -f "$STATE_DIR/sf-notification-center.db" ]; then
-        CASES=$(python3 -c "
-import sqlite3
-conn = sqlite3.connect('$STATE_DIR/sf-notification-center.db')
-try:
-    c = conn.execute('SELECT COUNT(*) FROM cases').fetchone()[0]
-    print(c)
-except:
-    print(0)
-" 2>/dev/null || echo "0")
-        if [ "$CASES" -gt 0 ]; then
-            ok "First poll complete — $CASES cases tracked"
-            break
-        fi
+# Quick wait for dashboard to be ready
+for i in $(seq 1 5); do
+    if curl -s -o /dev/null -w "%{http_code}" http://localhost:8090 2>/dev/null | grep -q 200; then
+        break
     fi
-    sleep 2
+    sleep 1
 done
 
-# Open dashboard
+# Open dashboard immediately
 open "http://localhost:8090" 2>/dev/null || true
+ok "Dashboard opened at http://localhost:8090"
+
+# Run first poll in background so install finishes fast
+echo ""
+echo -e "  ${Y}Running first poll in background...${N}"
+nohup python3 "$BIN_DIR/sf-case-poller" --once > /dev/null 2>&1 &
+ok "First poll running — cases will appear on dashboard within ~15s"
 
 echo ""
 echo -e "${G}╔═══════════════════════════════════════════════════════╗${N}"

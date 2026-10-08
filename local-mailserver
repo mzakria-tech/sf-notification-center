@@ -707,22 +707,26 @@ def _watchdog_loop():
                 subprocess.run(["open", "-gja", "Mail"], capture_output=True, timeout=10)
                 _watchdog_log("✓ Mail.app started")
 
-            # 3. Check SSH/GraphQL connectivity (cached for dashboard)
+            # 3. Check SSH/GraphQL — use poller heartbeat as proxy (avoids slow SSH)
+            #    If poller polled successfully recently, SSH/GraphQL must be working
             try:
-                cfg = _read_config()
-                ssh_user = cfg.get("supportshell_user", "mzakria")
-                ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
-                r = subprocess.run(
-                    ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", ssh_host, "echo ok"],
-                    capture_output=True, text=True, timeout=12)
-                ssh_ok = "ok" in (r.stdout or "")
+                hb_path = os.path.expanduser("~/.local/state/sf-poller-heartbeat.json")
+                with open(hb_path) as f:
+                    hb = json.load(f)
+                last = datetime.fromisoformat(hb["last_successful_poll"])
+                age = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)).total_seconds()
+                status_ok = hb.get("status") == "OK"
+                cases = hb.get("cases", 0)
+                ssh_ok = status_ok and age < 300 and cases > 0
                 SSH_STATUS["running"] = ssh_ok
                 SSH_STATUS["last_check"] = time.time()
                 if not ssh_ok:
-                    _watchdog_log("⚠ SSH to supportshell not reachable")
-            except Exception:
+                    _watchdog_log(f"⚠ SSH/GraphQL: heartbeat stale ({int(age)}s) or status={hb.get('status')}")
+            except FileNotFoundError:
+                pass  # first run
+            except Exception as e:
                 SSH_STATUS["running"] = False
-                _watchdog_log("⚠ SSH check timed out")
+                _watchdog_log(f"⚠ SSH status check error: {str(e)[:60]}")
 
             # 4. Check SMTP relay
             try:
