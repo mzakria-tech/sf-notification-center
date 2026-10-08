@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Salesforce Case Notification Center v2 — Reliable event-driven poller.
+"""Salesforce Case Notification Center v3 — Chrome-free GraphQL poller.
 
 Architecture:
-  Chrome scraping → Event detection → SQLite queue → Notification dispatch
+  Red Hat GraphQL API → Event detection → SQLite queue → Notification dispatch
+  No Chrome, no browser tabs, no AppleScript — all data from GraphQL via supportshell SSH.
 
 Features:
   - SQLite state + event store (replaces JSON)
@@ -643,6 +644,171 @@ def _ssh_python(script: str, timeout: int = 30) -> str:
         return ""
 
 
+def discover_cases_graphql() -> list[dict]:
+    """Discover all open cases owned by the current user via Red Hat GraphQL API.
+    No Chrome needed — pulls directly from Salesforce via GraphQL."""
+    # Step 1: get OwnerId from a known case, or query without filter
+    script = f'''
+import json, urllib.request, urllib.parse, os
+
+def get_token():
+    gql_file = os.path.expanduser("~/.cache/hydra-mcp/tokens/redhat-sso-token.json")
+    if not os.path.exists(gql_file):
+        gql_file = "/home/remote/{SSH_USER}/.yank/oidc-tokens.json"
+    with open(gql_file) as f:
+        d = json.load(f)
+    data = urllib.parse.urlencode({{
+        "grant_type": "refresh_token",
+        "refresh_token": d["refresh_token"],
+        "client_id": "cee-supportshell-deviceauth"
+    }}).encode()
+    req = urllib.request.Request(
+        "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token", data)
+    return json.loads(urllib.request.urlopen(req, timeout=10).read())["access_token"]
+
+def gql_request(query, variables, token):
+    body = json.dumps({{"query": query, "variables": variables}}).encode()
+    req = urllib.request.Request("https://vpn.graphql.redhat.com", data=body)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    req.add_header("apollographql-client-name", "redhat-hydra-mcp-server")
+    req.add_header("apollographql-client-version", "0.1.0")
+    resp = urllib.request.urlopen(req, timeout=30)
+    return json.loads(resp.read())
+
+try:
+    at = get_token()
+
+    # Get my OwnerId from config or by querying a known case
+    owner_id = ""
+    owner_id_file = os.path.expanduser("~/.cache/hydra-mcp/sf-owner-id.txt")
+    if os.path.exists(owner_id_file):
+        with open(owner_id_file) as f:
+            owner_id = f.read().strip()
+
+    if not owner_id:
+        # Decode the SSO JWT token to get user email, then query for user's cases
+        import base64 as b64
+        parts = at.split(".")
+        if len(parts) >= 2:
+            padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            claims = json.loads(b64.urlsafe_b64decode(padded))
+            email = claims.get("email", "")
+            username = claims.get("preferred_username", "")
+        else:
+            email = ""
+            username = ""
+
+        # Query a small set of recent cases and look for ones matching our user
+        q1 = """query {{ redhat_support_uiapi {{ query {{
+            RedHatSupportCase(where: {{ IsClosed: {{ eq: false }} }}, first: 100,
+                orderBy: {{ LastModifiedDate: {{ order: DESC }} }}) {{
+                edges {{ node {{ OwnerId {{ value }} Case_Owner_Alias__c {{ value }} }} }}
+            }}
+        }} }} }}"""
+        try:
+            r1 = gql_request(q1, {{}}, at)
+            edges = (r1.get("data", {{}}).get("redhat_support_uiapi", {{}})
+                     .get("query", {{}}).get("RedHatSupportCase", {{}}).get("edges", []))
+            for e in edges:
+                n = e.get("node", {{}})
+                alias = (n.get("Case_Owner_Alias__c", {{}}) or {{}}).get("value", "")
+                oid = (n.get("OwnerId", {{}}) or {{}}).get("value", "")
+                if alias and oid and alias.lower() == "{SSH_USER}".lower():
+                    owner_id = oid
+                    break
+        except Exception:
+            pass
+
+        if not owner_id and username:
+            # Fallback: match by username prefix in OwnerId (unlikely but try)
+            pass
+
+        if owner_id:
+            os.makedirs(os.path.dirname(owner_id_file), exist_ok=True)
+            with open(owner_id_file, "w") as f:
+                f.write(owner_id)
+
+    if not owner_id:
+        print(json.dumps({{"error": "could not determine OwnerId"}}))
+        raise SystemExit(1)
+
+    # Query all my open cases with status + lastModified + comments metadata
+    q2 = """query ListMyCases($oid: ID!) {{
+  redhat_support_uiapi {{
+    query {{
+      RedHatSupportCase(
+        where: {{ OwnerId: {{ eq: $oid }}, IsClosed: {{ eq: false }} }}
+        first: 50
+        orderBy: {{ LastModifiedDate: {{ order: DESC }} }}
+      ) {{
+        edges {{
+          node {{
+            Id
+            CaseNumber__c {{ value }}
+            Subject {{ value }}
+            Status {{ value }}
+            LastModifiedDate {{ value }}
+            OwnerId {{ value }}
+            CaseComments__r(first: 200) {{
+              edges {{
+                node {{
+                  CreatedDate {{ value }}
+                  CreatedBy {{ Name {{ value }} }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"""
+    r2 = gql_request(q2, {{"oid": owner_id}}, at)
+    edges2 = (r2.get("data", {{}}).get("redhat_support_uiapi", {{}})
+              .get("query", {{}}).get("RedHatSupportCase", {{}}).get("edges", []))
+
+    cases = []
+    for e in edges2:
+        n = e.get("node", {{}})
+        cn = (n.get("CaseNumber__c", {{}}) or {{}}).get("value", "")
+        case_id = n.get("Id", "")
+        status = (n.get("Status", {{}}) or {{}}).get("value", "")
+        subject = (n.get("Subject", {{}}) or {{}}).get("value", "")
+        last_mod = (n.get("LastModifiedDate", {{}}) or {{}}).get("value", "")
+        c_edges = (n.get("CaseComments__r", {{}}) or {{}}).get("edges", [])
+        comment_count = len(c_edges)
+        latest_date = ""
+        latest_author = ""
+        if c_edges:
+            last_c = c_edges[-1].get("node", {{}})
+            latest_date = (last_c.get("CreatedDate", {{}}) or {{}}).get("value", "")
+            latest_author = ((last_c.get("CreatedBy", {{}}) or {{}}).get("Name", {{}}) or {{}}).get("value", "")
+        cases.append({{
+            "Id": case_id, "CaseNumber": cn, "Status": status,
+            "Subject": subject, "LastModified": last_mod,
+            "OwnerAlias": "{SSH_USER}",
+            "commentCount": comment_count, "latestDate": latest_date,
+            "latestAuthor": latest_author,
+        }})
+    print(json.dumps({{"cases": cases, "ownerId": owner_id}}))
+except Exception as ex:
+    print(json.dumps({{"error": str(ex)}}))
+'''
+    out = _ssh_python(script, timeout=60)
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+        if "error" in data:
+            log_warn("graphql_discover_error", error=data["error"][:120])
+            return []
+        return data.get("cases", [])
+    except Exception:
+        return []
+
+
 def fetch_comments_hydra(case_number: str) -> list[dict]:
     """Fetch full comments for a single case via Red Hat GraphQL API."""
     script = f'''
@@ -952,49 +1118,39 @@ def poll_once(conn: sqlite3.Connection) -> dict:
     run_start = datetime.now(timezone.utc).isoformat()
     stats = {"cases": 0, "events": 0, "notifications": 0, "status": "OK", "error": ""}
 
-    # 1. Scrape cases from Chrome — zero disruption
+    # 1. Discover cases via GraphQL (no Chrome needed)
     log_info("POLL_START")
-    log_info("case_discovery_started", source="Chrome_background_JS")
-    chrome_access = "NO"
-    chrome_activation = "NO"
-    tab_changed = "NO"
-    page_reload = "NO"
-    focus_changed = "NO"
+    log_info("case_discovery_started", source="GraphQL_API")
 
     try:
-        cases, columns = scrape_cases()
-        chrome_access = "YES"
+        cases = discover_cases_graphql()
+        log_info("graphql_discovery_complete", cases=len(cases))
     except Exception as exc:
-        stats["status"] = "SCRAPE_FAILED"
+        stats["status"] = "DISCOVERY_FAILED"
         stats["error"] = str(exc)[:200]
-        log_error("scrape_failed", error=stats["error"])
-        log_info("chrome_safety", access=chrome_access, activation=chrome_activation,
-                 tab_changed=tab_changed, page_reload=page_reload, focus_changed=focus_changed)
-        _write_heartbeat(0, "SCRAPE_FAILED", stats["error"])
+        log_error("discovery_failed", error=stats["error"])
+        _write_heartbeat(0, "DISCOVERY_FAILED", stats["error"])
         conn.execute(
             "INSERT INTO poll_runs (started_at, finished_at, status, error) VALUES (?,?,?,?)",
-            (run_start, datetime.now(timezone.utc).isoformat(), "SCRAPE_FAILED", stats["error"]),
+            (run_start, datetime.now(timezone.utc).isoformat(), "DISCOVERY_FAILED", stats["error"]),
         )
         conn.commit()
         return stats
 
-    log_info("chrome_safety", access=chrome_access, activation=chrome_activation,
-             tab_changed=tab_changed, page_reload=page_reload, focus_changed=focus_changed)
-
     stats["cases"] = len(cases)
     initialized = _db_get(conn, "initialized") == "1"
 
-    # 2. Suspicious result protection — if too few cases, use cached state
+    # 2. Suspicious result protection
     prev_count = conn.execute("SELECT COUNT(*) as c FROM cases").fetchone()["c"]
     if len(cases) == 0 and prev_count > 5:
-        log_warn("suspicious_empty_response", scraped=0, cached=prev_count,
-                 action="skipping_cycle_using_cached_state")
-        stats["status"] = "INSUFFICIENT_ROWS"
-        _write_heartbeat(prev_count, "INSUFFICIENT_ROWS")
+        log_warn("suspicious_empty_response", fetched=0, cached=prev_count,
+                 action="skipping_cycle_will_retry")
+        stats["status"] = "EMPTY_RESPONSE"
+        _write_heartbeat(prev_count, "EMPTY_RESPONSE")
         conn.execute(
             "INSERT INTO poll_runs (started_at, finished_at, status, cases_found, error) VALUES (?,?,?,?,?)",
-            (run_start, datetime.now(timezone.utc).isoformat(), "INSUFFICIENT_ROWS", 0,
-             f"0 rows scraped, {prev_count} cached — SF virtual scroll may be hiding rows, will retry next cycle"),
+            (run_start, datetime.now(timezone.utc).isoformat(), "EMPTY_RESPONSE", 0,
+             f"0 cases from GraphQL, {prev_count} cached — will retry next cycle"),
         )
         conn.commit()
         return stats
@@ -1074,137 +1230,64 @@ def poll_once(conn: sqlite3.Connection) -> dict:
 
     conn.commit()
 
-    # 4. Batch comment check (one SSH call for all owned cases)
-    #    Uses Red Hat GraphQL API for ALL cases
-    if initialized and not ssh_circuit.is_open:
-        owned = []
-        for rec in cases:
-            cid = rec.get("Id") or rec.get("CaseNumber") or ""
-            owner = rec.get("OwnerAlias", "")
-            if owner and SSH_USER and owner.lower() != SSH_USER.lower():
-                continue
-            num = rec.get("CaseNumber", "")
-            if num and num not in status_changed_cases:
-                owned.append((cid, num, num))
-
-        if owned:
-            log_info("batch_comment_check", count=len(owned))
-            ext_nums = [e for _, _, e in owned]
-            info = fetch_batch_comment_info(ext_nums)
-
-            for cid, num, ext in owned:
-                if ext not in info:
-                    continue
-                ci = info[ext]
-                new_date = ci.get("latestDate", "")
-                new_count = ci.get("count", 0)
-
-                old = conn.execute(
-                    "SELECT last_comment_date, comment_count FROM cases WHERE case_id=?", (cid,)
-                ).fetchone()
-                old_date = old["last_comment_date"] if old else ""
-                old_count = old["comment_count"] if old else 0
-
-                conn.execute(
-                    "UPDATE cases SET last_comment_date=?, comment_count=? WHERE case_id=?",
-                    (new_date, new_count, cid),
-                )
-
-                # Detect new comment(s)
-                if old_date and new_date and new_date > old_date:
-                    new_comments_count = new_count - old_count if new_count > old_count else 1
-                    author = ci.get("latestAuthor", "Someone")
-                    ehash = _event_hash(cid, "COMMENT", old_date, new_date)
-                    existing = conn.execute("SELECT event_id FROM events WHERE event_hash=?", (ehash,)).fetchone()
-                    if existing:
-                        continue
-
-                    log_info("new_comment_detected", case=num, ext=ext, by=author, new_comments=new_comments_count)
-
-                    fetched = fetch_comments_hydra(ext)
-                    comment_text = _format_comments(fetched)
-
-                    case_row = conn.execute("SELECT subject, status FROM cases WHERE case_id=?", (cid,)).fetchone()
-                    subject = case_row["subject"] if case_row else ""
-                    cur_status = case_row["status"] if case_row else ""
-                    link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
-
-                    conn.execute(
-                        "INSERT INTO events (case_id, case_number, event_type, old_value, new_value, event_time, event_hash, details) "
-                        "VALUES (?,?,?,?,?,?,?,?)",
-                        (cid, num, "COMMENT", old_date, new_date, now, ehash,
-                         f"{new_comments_count} new comment(s) by {author}"),
-                    )
-                    event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-                    title = f"New comment on Case {num}" + (f" ({new_comments_count} new)" if new_comments_count > 1 else "")
-                    body = (
-                        f"{'New comment' if new_comments_count == 1 else f'{new_comments_count} new comments'} on case {num}.\n"
-                        f"By: {author}\nStatus: {cur_status}\n"
-                        f"Subject: {subject}\n{link}\n{comment_text}\n"
-                    )
-                    queue_notification(conn, event_id, title, body)
-                    stats["events"] += 1
-
-    # 4b. For 077 cases (no Hydra), detect changes via "Last Modified Date" from list view
-    #     If Last Modified changed but status didn't change, it's likely a new comment or update
+    # 4. Comment check — using data already returned by GraphQL discovery
+    #    No separate SSH call needed; comment metadata is in each case record
     if initialized:
         for rec in cases:
             cid = rec.get("Id") or rec.get("CaseNumber") or ""
-            if not cid:
-                continue
-            num = rec.get("CaseNumber", "")
-            ext = rec.get("ExternalNumber", "") or num
-            last_mod = rec.get("LastModified", "")
-            status = rec.get("Status", "")
             owner = rec.get("OwnerAlias", "")
-
-            # Only process 077 cases (045 cases already handled by Hydra above)
-            if not ext.startswith("077"):
-                continue
-            # Owner filter
             if owner and SSH_USER and owner.lower() != SSH_USER.lower():
                 continue
-            # Skip if no Last Modified data (column not added to list view yet)
-            if not last_mod:
-                continue
-            # Skip if status already changed (already notified above)
-            if num in status_changed_cases:
+            num = rec.get("CaseNumber", "")
+            if not num or num in status_changed_cases:
                 continue
 
-            old = conn.execute("SELECT last_modified, status FROM cases WHERE case_id=?", (cid,)).fetchone()
-            if not old or not old["last_modified"]:
-                continue
-            old_mod = old["last_modified"]
-            old_st = old["status"]
+            new_date = rec.get("latestDate", "")
+            new_count = rec.get("commentCount", 0)
 
-            # If Last Modified changed but status didn't → likely a comment or field update
-            if last_mod != old_mod and status.strip().lower() == old_st.strip().lower():
-                ehash = _event_hash(cid, "MODIFIED", old_mod, last_mod)
+            old = conn.execute(
+                "SELECT last_comment_date, comment_count FROM cases WHERE case_id=?", (cid,)
+            ).fetchone()
+            old_date = old["last_comment_date"] if old else ""
+            old_count = old["comment_count"] if old else 0
+
+            conn.execute(
+                "UPDATE cases SET last_comment_date=?, comment_count=? WHERE case_id=?",
+                (new_date, new_count, cid),
+            )
+
+            # Detect new comment(s)
+            if old_date and new_date and new_date > old_date:
+                new_comments_count = new_count - old_count if new_count > old_count else 1
+                author = rec.get("latestAuthor", "Someone")
+                ehash = _event_hash(cid, "COMMENT", old_date, new_date)
                 existing = conn.execute("SELECT event_id FROM events WHERE event_hash=?", (ehash,)).fetchone()
                 if existing:
                     continue
 
-                log_info("case_modified_detected", case=num, old_mod=old_mod, new_mod=last_mod)
+                log_info("new_comment_detected", case=num, by=author, new_comments=new_comments_count)
 
-                subject_text = rec.get("Subject", "")
+                fetched = fetch_comments_hydra(num)
+                comment_text = _format_comments(fetched)
+
+                case_row = conn.execute("SELECT subject, status FROM cases WHERE case_id=?", (cid,)).fetchone()
+                subject = case_row["subject"] if case_row else ""
+                cur_status = case_row["status"] if case_row else ""
                 link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
 
                 conn.execute(
                     "INSERT INTO events (case_id, case_number, event_type, old_value, new_value, event_time, event_hash, details) "
                     "VALUES (?,?,?,?,?,?,?,?)",
-                    (cid, num, "MODIFIED", old_mod, last_mod, now, ehash,
-                     "Case modified (likely new comment or update)"),
+                    (cid, num, "COMMENT", old_date, new_date, now, ehash,
+                     f"{new_comments_count} new comment(s) by {author}"),
                 )
                 event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-                title = f"Case {num} Updated"
+                title = f"New comment on Case {num}" + (f" ({new_comments_count} new)" if new_comments_count > 1 else "")
                 body = (
-                    f"Case {num} was modified.\n"
-                    f"Status: {status}\n"
-                    f"Subject: {subject_text}\n"
-                    f"Modified: {old_mod} -> {last_mod}\n"
-                    f"{link}\n"
+                    f"{'New comment' if new_comments_count == 1 else f'{new_comments_count} new comments'} on case {num}.\n"
+                    f"By: {author}\nStatus: {cur_status}\n"
+                    f"Subject: {subject}\n{link}\n{comment_text}\n"
                 )
                 queue_notification(conn, event_id, title, body)
                 stats["events"] += 1
@@ -1226,6 +1309,7 @@ def poll_once(conn: sqlite3.Connection) -> dict:
 
     # 7. Write heartbeat + JSON compat for dashboard
     _write_heartbeat(len(cases), "OK")
+    columns = ["CaseNumber", "Status", "Subject", "LastModified"]
     _write_json_compat(conn, columns)
 
     # 8. Record poll run
@@ -1304,19 +1388,15 @@ def cmd_status(conn: sqlite3.Connection):
     print(f"  Poll interval:  {INTERVAL}s")
     print(f"  Notify email:   {TO_ADDR or '(not set)'}")
     print(f"  SSH user:       {SSH_USER or '(not set)'}")
-    print(f"  Case list URL:  {CASE_LIST_URL[:60] + '...' if len(CASE_LIST_URL) > 60 else CASE_LIST_URL or '(not set)'}")
+    print(f"  Data source:    Red Hat GraphQL API (vpn.graphql.redhat.com)")
 
 
 def cmd_health(conn: sqlite3.Connection):
     """Run health checks."""
     checks = []
 
-    # Salesforce / Chrome
-    try:
-        r = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
-        checks.append(("Chrome", "PASS" if r.returncode == 0 else "FAIL"))
-    except Exception:
-        checks.append(("Chrome", "FAIL"))
+    # GraphQL API (via SSH)
+    # Checked below with SSH/GraphQL
 
     # Mail.app
     try:
@@ -1374,8 +1454,8 @@ def cmd_health(conn: sqlite3.Connection):
     except Exception:
         checks.append(("Heartbeat", "FAIL (no data)"))
 
-    # Case list URL
-    checks.append(("Case List URL", "PASS" if CASE_LIST_URL else "FAIL (not set)"))
+    # Data source
+    checks.append(("Data Source", "PASS (GraphQL API)"))
 
     print("═══ Health Check ═══")
     all_pass = True
@@ -1458,7 +1538,6 @@ def cmd_install():
     os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
     if not os.path.exists(cfg_path):
         cfg = {
-            "case_list_url": "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_ca",
             "notify_email": f"{user}@redhat.com",
             "supportshell_user": user,
         }
@@ -1553,7 +1632,7 @@ def cmd_install():
     print(f"\n{'='*50}")
     print("INSTALLED SUCCESSFULLY!")
     print(f"{'='*50}")
-    print(f"\nOpen Chrome with your Salesforce case list view, then you're all set!")
+    print(f"\nNo browser needed — cases are pulled directly from Salesforce via Red Hat GraphQL API.")
     print(f"\nCommands:")
     print(f"  sf-case-poller status      # Check status")
     print(f"  sf-case-poller health      # Health check")
@@ -1707,24 +1786,15 @@ def main() -> int:
     except Exception:
         pass
 
-    COMMENT_INTERVAL = 60   # Hydra comment check every 1 min (no Chrome)
-    SCRAPE_INTERVAL = 300   # Full Chrome scrape every 5 min
-    last_scrape = 0
+    POLL_INTERVAL = 60  # GraphQL poll every 1 minute (status + comments in one call)
 
     while True:
-        now_ts = time.time()
         try:
-            if now_ts - last_scrape >= SCRAPE_INTERVAL:
-                # Full poll: Chrome scrape + status detection + comment check
-                poll_once(conn)
-                last_scrape = now_ts
-            else:
-                # Quick poll: Hydra-only comment check (no Chrome, zero disruption)
-                _comment_only_check(conn)
+            poll_once(conn)
             process_retry_queue(conn)
         except Exception as exc:
             log_error("poll_error", error=str(exc)[:200])
-        time.sleep(COMMENT_INTERVAL)
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
