@@ -24,6 +24,54 @@ warn() { echo -e "  ${Y}⚠${N} $1"; }
 fail() { echo -e "  ${R}✗${N} $1"; }
 step() { echo -e "\n${B}[$1]${N} ${BOLD}$2${N}"; }
 
+# ═══════════════════════════════════════════════════════════════
+# UNINSTALL — ./install.sh uninstall
+# ═══════════════════════════════════════════════════════════════
+if [ "${1:-}" = "uninstall" ]; then
+    echo ""
+    echo -e "${R}╔═══════════════════════════════════════════════════════╗${N}"
+    echo -e "${R}║   SF Notification Center — Uninstaller               ║${N}"
+    echo -e "${R}╚═══════════════════════════════════════════════════════╝${N}"
+
+    step "1/4" "Stopping services"
+    launchctl stop "$POLLER_LABEL" 2>/dev/null
+    launchctl unload "$LAUNCH_DIR/$POLLER_LABEL.plist" 2>/dev/null
+    launchctl stop "$MAILER_LABEL" 2>/dev/null
+    launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null
+    pkill -f "local-mailserver" 2>/dev/null
+    ok "All services stopped"
+
+    step "2/4" "Removing LaunchAgents"
+    rm -f "$LAUNCH_DIR/$POLLER_LABEL.plist"
+    rm -f "$LAUNCH_DIR/$MAILER_LABEL.plist"
+    ok "LaunchAgent plists removed"
+
+    step "3/4" "Removing scripts and state"
+    rm -f "$BIN_DIR/sf-case-poller"
+    rm -f "$BIN_DIR/local-mailserver"
+    rm -f "$STATE_DIR/sf-notification-center.db"
+    rm -f "$STATE_DIR/sf-poller-config.json"
+    rm -f "$STATE_DIR/sf-case-status.json"
+    rm -f "$STATE_DIR/sf-poller-heartbeat.json"
+    rm -f "$LOG_DIR/sf-case-poller.log"
+    rm -f /tmp/local-mailserver.log
+    ok "Scripts, database, config, and logs removed"
+
+    step "4/4" "Done"
+    echo ""
+    echo -e "${G}╔═══════════════════════════════════════════════════════╗${N}"
+    echo -e "${G}║  ${BOLD}✅ Completely uninstalled!${N}${G}                             ║${N}"
+    echo -e "${G}║                                                       ║${N}"
+    echo -e "${G}║  To reinstall:  ${BOLD}./install.sh${N}${G}                           ║${N}"
+    echo -e "${G}╚═══════════════════════════════════════════════════════╝${N}"
+    exit 0
+fi
+
+ok()   { echo -e "  ${G}✓${N} $1"; }
+warn() { echo -e "  ${Y}⚠${N} $1"; }
+fail() { echo -e "  ${R}✗${N} $1"; }
+step() { echo -e "\n${B}[$1]${N} ${BOLD}$2${N}"; }
+
 echo ""
 echo -e "${BOLD}╔═══════════════════════════════════════════════════════╗${N}"
 echo -e "${BOLD}║   SF Notification Center — Automatic Installer       ║${N}"
