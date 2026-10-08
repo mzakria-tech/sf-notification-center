@@ -278,19 +278,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div class="logo">SF</div>
   <h1>Notification Center</h1>
 </div>
-<div class="subtitle">Salesforce case status alerts &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
-
-<!-- Monitor Settings — top of page -->
-<div class="section-title"><span class="icon">🎯</span> Case View to Monitor</div>
-<div class="config-card">
-  <div style="font-size:14px;color:#f8fafc;font-weight:700;margin-bottom:6px">📌 Salesforce List View URL</div>
-  <div class="config-hint">Paste your Salesforce case list view URL below. The poller monitors whichever view you set here.</div>
-  <div class="config-current" style="margin:8px 0">Active: <a href="{case_list_url}" target="_blank">{case_list_url}</a></div>
-  <div class="config-row">
-    <input class="config-input" id="viewUrl" type="text" placeholder="https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=..." value="{case_list_url}">
-    <button class="config-save" id="saveBtn" onclick="saveConfig()">💾 Save &amp; Restart</button>
-  </div>
-</div>
+<div class="subtitle">Salesforce case status alerts &bull; Polls every 1 min via GraphQL API &bull; Auto-refreshes 15s</div>
 
 <!-- Service Health -->
 <div class="svc-grid">
@@ -374,36 +362,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 <div class="footer">SF Notification Center &bull; Red Hat Support</div>
 <script>
-function saveConfig() {
-    var btn = document.getElementById('saveBtn');
-    var url = document.getElementById('viewUrl').value.trim();
-    if (!url || !url.includes('lightning')) {
-        alert('Please enter a valid Salesforce Lightning list view URL');
-        return;
-    }
-    btn.textContent = 'Saving...';
-    btn.classList.add('saving');
-    fetch('/api/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({case_list_url: url})
-    })
-    .then(r => r.json())
-    .then(d => {
-        if (d.ok) {
-            btn.textContent = '✓ Saved!';
-            btn.classList.remove('saving');
-            btn.classList.add('saved');
-            setTimeout(() => location.reload(), 3000);
-        } else {
-            btn.textContent = '✗ ' + d.msg;
-            btn.classList.remove('saving');
-        }
-    })
-    .catch(() => {
-        btn.textContent = '✗ Error';
-        btn.classList.remove('saving');
-    });
+
 }
 
 function startService(svc, btn) {
