@@ -60,19 +60,33 @@ class MailHandler(Message):
 
 
 def _check_service(name: str) -> dict:
-    """Check if a service is running."""
+    """Check if a service is running. Returns running, label, and fix hint."""
+    cfg = _read_config()
+    ssh_user = cfg.get("supportshell_user", _USER)
+    ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+
     if name == "poller":
         r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        running = "com.mzakria.sf-case-poller" in (r.stdout or "")
-        return {"running": running, "label": "SF Case Poller"}
+        running = POLLER_LABEL in (r.stdout or "")
+        return {"running": running, "label": "SF Case Poller",
+                "fix": "Run: bash install.sh"}
     elif name == "mailserver":
-        return {"running": True, "label": "Mail Server"}
-    elif name == "chrome":
-        return {"running": SSH_STATUS["running"], "label": "SSH/GraphQL"}
+        return {"running": True, "label": "Mail Server", "fix": ""}
+    elif name == "ssh":
+        has_key = os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub")) or os.path.exists(os.path.expanduser("~/.ssh/id_ed25519.pub"))
+        if not has_key:
+            return {"running": False, "label": "SSH Key",
+                    "fix": f"Run: ssh-keygen && ssh-copy-id {ssh_host}"}
+        return {"running": SSH_STATUS["running"], "label": "SSH/GraphQL",
+                "fix": f"Run: ssh-copy-id {ssh_host}"}
+    elif name == "gql_token":
+        return {"running": SSH_STATUS["running"], "label": "GraphQL Token",
+                "fix": f"Run: ssh {ssh_host} then: redhat-hydra-auth --production"}
     elif name == "mailapp":
         r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
-        return {"running": r.returncode == 0, "label": "Mail.app"}
-    return {"running": False, "label": name}
+        return {"running": r.returncode == 0, "label": "Mail.app",
+                "fix": "Open Mail.app and sign into your email account"}
+    return {"running": False, "label": name, "fix": ""}
 
 
 def _read_cases() -> tuple[list[dict], list[str]]:
@@ -115,7 +129,7 @@ def _last_log_lines(n=5) -> list[str]:
 def _get_status_data() -> dict:
     """Gather all live status data."""
     poller = _check_service("poller")
-    chrome = _check_service("chrome")
+    chrome = _check_service("ssh")
     mailapp = _check_service("mailapp")
     state = _read_state()
     cases, columns = _read_cases()
@@ -445,10 +459,21 @@ def _render(data: dict) -> str:
     def start_btn(svc_id, label="▶ Start"):
         return f'<button class="start-btn" onclick="startService(\'{svc_id}\', this)">{label}</button>'
 
-    ms_fix = "" if data["mailserver"]["running"] else start_btn("mailserver", "▶ Start Mail Server")
-    pl_fix = "" if data["poller"]["running"] else start_btn("poller", "▶ Start Poller")
-    cr_fix = "" if data["chrome"]["running"] else '<div class="svc-fix">SSH to supportshell not reachable</div>'
-    ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
+    def fix_cmd(svc_data, btn_id=None, btn_label=None):
+        if svc_data["running"]:
+            return ""
+        fix = svc_data.get("fix", "")
+        html = ""
+        if btn_id and btn_label:
+            html += start_btn(btn_id, btn_label)
+        if fix:
+            html += f'<div class="fix-cmd">{fix}</div>'
+        return html
+
+    ms_fix = fix_cmd(data["mailserver"])
+    pl_fix = fix_cmd(data["poller"], "poller", "▶ Start Poller")
+    cr_fix = fix_cmd(data["chrome"])
+    ma_fix = fix_cmd(data["mailapp"], "mailapp", "▶ Open Mail.app")
 
     # Cases table — dynamically match Salesforce columns
     cases = data["cases"]
@@ -680,13 +705,18 @@ def _watchdog_log(msg: str):
 
 
 def _watchdog_loop():
-    """Self-healing watchdog — checks every 30s, auto-fixes anything down."""
-    time.sleep(10)  # initial delay to let services start
+    """Self-healing watchdog — checks every 60s, auto-fixes anything broken."""
+    time.sleep(10)
     _watchdog_log("Watchdog started — monitoring all services")
+    hb_path = os.path.expanduser("~/.local/state/sf-poller-heartbeat.json")
+    db_path = os.path.expanduser("~/.local/state/sf-notification-center.db")
+    cfg_path = CONFIG_PATH
+    log_path = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
+    bin_dir = os.path.expanduser("~/.local/bin")
 
     while True:
         try:
-            # 1. Check SF Poller
+            # ── 1. SF Poller process ──
             r = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
             if POLLER_LABEL not in (r.stdout or ""):
                 _watchdog_log("⚠ SF Poller not running — restarting...")
@@ -696,68 +726,140 @@ def _watchdog_loop():
                     time.sleep(1)
                     subprocess.run(["launchctl", "load", plist], capture_output=True, timeout=5)
                     subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
-                    _watchdog_log("✓ SF Poller restarted via LaunchAgent")
+                    _watchdog_log("✓ SF Poller restarted")
                 else:
-                    _watchdog_log("✗ Poller plist missing — run install.sh again")
+                    # Plist missing — recreate it
+                    _watchdog_log("⚠ Poller plist missing — recreating...")
+                    python = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
+                    plist_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{POLLER_LABEL}</string>
+<key>ProgramArguments</key><array><string>{python}</string><string>{bin_dir}/sf-case-poller</string><string>poll</string></array>
+<key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>
+<key>StandardOutPath</key><string>{log_path}</string>
+<key>StandardErrorPath</key><string>{log_path}</string>
+</dict></plist>'''
+                    os.makedirs(LAUNCH_DIR, exist_ok=True)
+                    with open(plist, "w") as f:
+                        f.write(plist_content)
+                    subprocess.run(["launchctl", "load", plist], capture_output=True, timeout=5)
+                    subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
+                    _watchdog_log("✓ Poller plist recreated and started")
 
-            # 2. Check Mail.app
+            # ── 2. Mail.app ──
             r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True, timeout=5)
             if r.returncode != 0:
                 _watchdog_log("⚠ Mail.app not running — starting...")
                 subprocess.run(["open", "-gja", "Mail"], capture_output=True, timeout=10)
                 _watchdog_log("✓ Mail.app started")
 
-            # 3. Check SSH/GraphQL — use poller heartbeat as proxy (avoids slow SSH)
-            #    If poller polled successfully recently, SSH/GraphQL must be working
+            # ── 3. SSH/GraphQL status (from heartbeat — no slow SSH call) ──
             try:
-                hb_path = os.path.expanduser("~/.local/state/sf-poller-heartbeat.json")
                 with open(hb_path) as f:
                     hb = json.load(f)
                 last = datetime.fromisoformat(hb["last_successful_poll"])
                 age = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)).total_seconds()
-                status_ok = hb.get("status") == "OK"
-                cases = hb.get("cases", 0)
-                ssh_ok = status_ok and age < 300 and cases > 0
+                ssh_ok = hb.get("status") == "OK" and age < 300 and hb.get("cases", 0) > 0
                 SSH_STATUS["running"] = ssh_ok
                 SSH_STATUS["last_check"] = time.time()
                 if not ssh_ok:
-                    _watchdog_log(f"⚠ SSH/GraphQL: heartbeat stale ({int(age)}s) or status={hb.get('status')}")
+                    _watchdog_log(f"⚠ GraphQL: heartbeat stale ({int(age)}s) or status={hb.get('status')}")
             except FileNotFoundError:
-                pass  # first run
+                pass
             except Exception as e:
                 SSH_STATUS["running"] = False
-                _watchdog_log(f"⚠ SSH status check error: {str(e)[:60]}")
 
-            # 4. Check SMTP relay
+            # ── 4. SMTP relay ──
             try:
                 import smtplib
                 with smtplib.SMTP("127.0.0.1", 2525, timeout=3) as s:
                     s.noop()
             except Exception:
-                _watchdog_log("⚠ Local SMTP not responding on port 2525")
+                _watchdog_log("⚠ SMTP port 2525 not responding — should self-recover")
 
-            # 5. Check heartbeat freshness — if poller hasn't polled in 5 min, force restart
-            hb_path = os.path.expanduser("~/.local/state/sf-poller-heartbeat.json")
+            # ── 5. Heartbeat freshness → force restart stale poller ──
             try:
                 with open(hb_path) as f:
                     hb = json.load(f)
                 last = datetime.fromisoformat(hb["last_successful_poll"])
                 age = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)).total_seconds()
                 if age > 300:
-                    _watchdog_log(f"⚠ Poller heartbeat stale ({int(age)}s) — force restarting...")
+                    _watchdog_log(f"⚠ Poller stale ({int(age)}s) — force restarting...")
                     subprocess.run(["launchctl", "stop", POLLER_LABEL], capture_output=True, timeout=5)
                     time.sleep(2)
                     subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
-                    _watchdog_log("✓ SF Poller force-restarted (stale heartbeat)")
+                    _watchdog_log("✓ Poller force-restarted")
             except FileNotFoundError:
-                pass  # first run, no heartbeat yet
-            except Exception as e:
-                _watchdog_log(f"⚠ Heartbeat check error: {str(e)[:60]}")
+                pass
+            except Exception:
+                pass
+
+            # ── 6. Config file missing → recreate with defaults ──
+            if not os.path.exists(cfg_path):
+                _watchdog_log("⚠ Config missing — recreating defaults...")
+                user = os.environ.get("USER", "mzakria")
+                cfg = {"notify_email": f"{user}@redhat.com", "supportshell_user": user}
+                os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                _watchdog_log("✓ Config recreated with defaults")
+
+            # ── 7. DB file missing → next poller cycle will recreate, but trigger poll now ──
+            if not os.path.exists(db_path):
+                _watchdog_log("⚠ Database missing — triggering immediate poll...")
+                subprocess.run(["launchctl", "stop", POLLER_LABEL], capture_output=True, timeout=5)
+                time.sleep(1)
+                subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
+                _watchdog_log("✓ Poller restarted to rebuild database")
+
+            # ── 8. Log file too large (>50MB) → rotate ──
+            try:
+                if os.path.exists(log_path) and os.path.getsize(log_path) > 50_000_000:
+                    _watchdog_log("⚠ Log file >50MB — rotating...")
+                    rotated = log_path + ".old"
+                    if os.path.exists(rotated):
+                        os.remove(rotated)
+                    os.rename(log_path, rotated)
+                    _watchdog_log("✓ Log rotated (old → .old)")
+            except Exception:
+                pass
+
+            # ── 9. Stuck notifications → process retry queue ──
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db_path, timeout=5)
+                conn.row_factory = sqlite3.Row
+                stuck = conn.execute(
+                    "SELECT COUNT(*) as c FROM notifications WHERE status='RETRY' AND "
+                    "created_at < datetime('now', '-30 minutes')"
+                ).fetchone()["c"]
+                if stuck > 0:
+                    _watchdog_log(f"⚠ {stuck} stuck notifications — marking for retry...")
+                    conn.execute(
+                        "UPDATE notifications SET status='PENDING', retry_count=0 WHERE status='RETRY' AND "
+                        "created_at < datetime('now', '-30 minutes')"
+                    )
+                    conn.commit()
+                    _watchdog_log(f"✓ {stuck} notifications reset to PENDING")
+                conn.close()
+            except Exception:
+                pass
+
+            # ── 10. JSON state file missing → trigger poll ──
+            json_state = os.path.expanduser("~/.local/state/sf-case-status.json")
+            if not os.path.exists(json_state) and os.path.exists(db_path):
+                _watchdog_log("⚠ Dashboard JSON missing — triggering poll...")
+                subprocess.Popen(
+                    [subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip(),
+                     os.path.join(bin_dir, "sf-case-poller"), "--once"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _watchdog_log("✓ Background poll triggered")
 
         except Exception as e:
             _watchdog_log(f"✗ Watchdog error: {str(e)[:80]}")
 
-        time.sleep(60)  # check every 60s
+        time.sleep(60)
 
 
 def main():
