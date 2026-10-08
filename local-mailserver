@@ -798,11 +798,14 @@ def _watchdog_loop():
                     # Plist missing — recreate it
                     _watchdog_log("⚠ Poller plist missing — recreating...")
                     python = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
+                    ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
+                    home_dir = os.path.expanduser("~")
                     plist_content = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>{POLLER_LABEL}</string>
 <key>ProgramArguments</key><array><string>{python}</string><string>{bin_dir}/sf-case-poller</string><string>poll</string></array>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>{home_dir}</string><key>SSH_AUTH_SOCK</key><string>{ssh_sock}</string></dict>
 <key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>
 <key>StandardOutPath</key><string>{log_path}</string>
 <key>StandardErrorPath</key><string>{log_path}</string>

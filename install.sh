@@ -213,6 +213,14 @@ else
     ok "Mail.app already running"
 fi
 
+# Detect SSH_AUTH_SOCK for LaunchAgents
+SSH_SOCK="${SSH_AUTH_SOCK:-}"
+if [ -z "$SSH_SOCK" ]; then
+    # macOS default
+    SSH_SOCK="/private/tmp/com.apple.launchd.*/Listeners"
+    SSH_SOCK=$(ls $SSH_SOCK 2>/dev/null | head -1 || echo "")
+fi
+
 # --- Local Mailserver (SMTP + Dashboard on port 8090) ---
 launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null || true
 pkill -f "local-mailserver" 2>/dev/null || true
@@ -230,6 +238,13 @@ cat > "$LAUNCH_DIR/$MAILER_LABEL.plist" <<PLISTEOF
         <string>$PYTHON</string>
         <string>$BIN_DIR/local-mailserver</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME_DIR</string>
+        <key>SSH_AUTH_SOCK</key>
+        <string>$SSH_SOCK</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -265,6 +280,10 @@ cat > "$LAUNCH_DIR/$POLLER_LABEL.plist" <<PLISTEOF
     <dict>
         <key>SF_POLL_INTERVAL</key>
         <string>60</string>
+        <key>HOME</key>
+        <string>$HOME_DIR</string>
+        <key>SSH_AUTH_SOCK</key>
+        <string>$SSH_SOCK</string>
     </dict>
     <key>KeepAlive</key>
     <true/>
