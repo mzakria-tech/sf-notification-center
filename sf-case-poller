@@ -1416,11 +1416,222 @@ def cmd_history(conn: sqlite3.Connection, limit: int = 20):
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
-def main() -> int:
-    conn = _init_db()
+def _get_label():
+    return f"com.{os.environ.get('USER', 'mzakria')}.sf-case-poller"
 
+def _get_plist_path():
+    return os.path.expanduser(f"~/Library/LaunchAgents/{_get_label()}.plist")
+
+def cmd_install():
+    """Install poller, config, and LaunchAgent — everything needed to run."""
+    home = os.path.expanduser("~")
+    user = os.environ.get("USER", "mzakria")
+    script_src = os.path.abspath(__file__)
+    script_dst = os.path.join(home, ".local", "bin", "sf-case-poller")
+
+    # 1. Install script
+    os.makedirs(os.path.dirname(script_dst), exist_ok=True)
+    if os.path.abspath(script_src) != os.path.abspath(script_dst):
+        import shutil
+        shutil.copy2(script_src, script_dst)
+        os.chmod(script_dst, 0o755)
+    print(f"[1/4] Installed: {script_dst}")
+
+    # 2. Add to PATH
+    zshrc = os.path.join(home, ".zshrc")
+    path_line = 'export PATH="$HOME/.local/bin:$PATH"'
+    if os.path.exists(zshrc):
+        with open(zshrc) as f:
+            content = f.read()
+        if ".local/bin" not in content:
+            with open(zshrc, "a") as f:
+                f.write(f"\n{path_line}\n")
+            print("[2/4] Added ~/.local/bin to PATH in .zshrc")
+        else:
+            print("[2/4] PATH already configured")
+    else:
+        print("[2/4] No .zshrc found, add manually: " + path_line)
+
+    # 3. Create config
+    cfg_path = os.path.join(home, ".local", "state", "sf-poller-config.json")
+    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+    if not os.path.exists(cfg_path):
+        cfg = {
+            "case_list_url": "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_ca",
+            "notify_email": f"{user}@redhat.com",
+            "supportshell_user": user,
+        }
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"[3/4] Config created: {cfg_path}")
+    else:
+        print(f"[3/4] Config exists: {cfg_path}")
+
+    # 4. Install LaunchAgent
+    plist_path = _get_plist_path()
+    label = _get_label()
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>{script_dst}</string>
+        <string>poll</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SF_POLL_INTERVAL</key>
+        <string>60</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>{home}/Library/Logs/sf-case-poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>{home}/Library/Logs/sf-case-poller.log</string>
+</dict>
+</plist>"""
+    os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+    subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
+    with open(plist_path, "w") as f:
+        f.write(plist)
+    subprocess.run(["launchctl", "load", plist_path], capture_output=True)
+    subprocess.run(["launchctl", "start", label], capture_output=True)
+    print(f"[4/4] LaunchAgent installed and started")
+
+    # 5. Test SSH and setup GraphQL token on supportshell
+    print("[5/5] Setting up supportshell SSH + GraphQL token...")
+    ssh_host = f"{user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+    # Test SSH
+    ssh_test = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host, "echo SSH_OK"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if "SSH_OK" in (ssh_test.stdout or ""):
+        print(f"  SSH to supportshell: OK")
+        # Run redhat-hydra-auth to get GraphQL token
+        auth_result = subprocess.run(
+            ["ssh", ssh_host, "redhat-hydra-auth --production --no-yank 2>&1 || redhat-hydra-auth -p 2>&1; echo AUTH_DONE"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if "AUTH_DONE" in (auth_result.stdout or ""):
+            print(f"  GraphQL auth (redhat-hydra-auth): OK")
+        else:
+            print(f"  GraphQL auth: needs manual setup")
+            print(f"    Run: ssh {ssh_host}")
+            print(f"    Then: redhat-hydra-auth --production")
+        # Verify token exists
+        token_check = subprocess.run(
+            ["ssh", ssh_host, "test -f ~/.cache/hydra-mcp/tokens/redhat-sso-token.json && echo TOKEN_OK || test -f ~/.yank/oidc-tokens.json && echo TOKEN_OK"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "TOKEN_OK" in (token_check.stdout or ""):
+            print(f"  GraphQL token: OK")
+        else:
+            print(f"  GraphQL token: not found — run 'redhat-hydra-auth --production' on supportshell")
+    else:
+        print(f"  SSH to supportshell: FAILED")
+        print(f"    Fix: ssh-copy-id {ssh_host}")
+        print(f"    Then re-run: sf-case-poller install")
+
+    print(f"\n{'='*50}")
+    print("INSTALLED SUCCESSFULLY!")
+    print(f"{'='*50}")
+    print(f"\nOpen Chrome with your Salesforce case list view, then you're all set!")
+    print(f"\nCommands:")
+    print(f"  sf-case-poller status      # Check status")
+    print(f"  sf-case-poller health      # Health check")
+    print(f"  sf-case-poller start       # Start poller")
+    print(f"  sf-case-poller stop        # Stop poller")
+    print(f"  sf-case-poller restart     # Restart poller")
+    print(f"  sf-case-poller logs        # View live logs")
+    print(f"  sf-case-poller test-email  # Test email")
+    print(f"  sf-case-poller history     # Notification history")
+    print(f"  sf-case-poller uninstall   # Remove everything")
+
+def cmd_uninstall():
+    """Stop and remove poller, LaunchAgent. Keeps config and DB."""
+    label = _get_label()
+    plist_path = _get_plist_path()
+    script_path = os.path.expanduser("~/.local/bin/sf-case-poller")
+
+    subprocess.run(["launchctl", "stop", label], capture_output=True)
+    subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
+    if os.path.exists(plist_path):
+        os.remove(plist_path)
+    print("Uninstalled. Config and DB preserved in ~/.local/state/")
+
+def cmd_start():
+    label = _get_label()
+    subprocess.run(["launchctl", "start", label])
+    print("Started")
+
+def cmd_stop():
+    label = _get_label()
+    subprocess.run(["launchctl", "stop", label])
+    print("Stopped")
+
+def cmd_restart():
+    label = _get_label()
+    subprocess.run(["launchctl", "stop", label], capture_output=True)
+    import time as _t; _t.sleep(2)
+    subprocess.run(["launchctl", "start", label])
+    print("Restarted")
+
+def cmd_logs():
+    os.execvp("tail", ["tail", "-f", os.path.expanduser("~/Library/Logs/sf-case-poller.log")])
+
+
+def main() -> int:
     args = sys.argv[1:]
     cmd = args[0] if args else ""
+
+    # Commands that don't need DB
+    if cmd == "install":
+        cmd_install()
+        return 0
+    if cmd == "uninstall":
+        cmd_uninstall()
+        return 0
+    if cmd == "start":
+        cmd_start()
+        return 0
+    if cmd == "stop":
+        cmd_stop()
+        return 0
+    if cmd == "restart":
+        cmd_restart()
+        return 0
+    if cmd == "logs":
+        cmd_logs()
+        return 0
+    if cmd in ("help", "--help", "-h", ""):
+        print("SF Case Notification Center")
+        print("")
+        print("Setup:")
+        print("  sf-case-poller install     Install and start (one-time)")
+        print("  sf-case-poller uninstall   Remove everything")
+        print("")
+        print("Control:")
+        print("  sf-case-poller start       Start poller")
+        print("  sf-case-poller stop        Stop poller")
+        print("  sf-case-poller restart     Restart poller")
+        print("")
+        print("Monitor:")
+        print("  sf-case-poller status      Check status")
+        print("  sf-case-poller health      Health check")
+        print("  sf-case-poller logs        View live logs")
+        print("  sf-case-poller history     Notification history")
+        print("  sf-case-poller test-email  Test email delivery")
+        return 0
+
+    conn = _init_db()
 
     if cmd == "--status" or cmd == "status":
         cmd_status(conn)
@@ -1444,11 +1655,16 @@ def main() -> int:
         cmd_history(conn)
         return 0
 
-    if cmd == "--once" or cmd == "poll":
+    if cmd == "--once" or cmd == "once":
         log_info("poll_started", mode="once", url=CASE_LIST_URL[:80])
         stats = poll_once(conn)
         print(f"Poll complete: cases={stats['cases']} events={stats['events']} notifs={stats['notifications']} status={stats['status']}")
         return 0
+
+    if cmd != "poll":
+        print(f"Unknown command: {cmd}")
+        print("Run: sf-case-poller help")
+        return 1
 
     # Default: continuous polling
     log_info("service_started", interval=INTERVAL, url=CASE_LIST_URL[:80], pid=os.getpid())
