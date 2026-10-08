@@ -1505,40 +1505,41 @@ def cmd_install():
     subprocess.run(["launchctl", "start", label], capture_output=True)
     print(f"[4/4] LaunchAgent installed and started")
 
-    # 5. Test SSH and setup GraphQL token on supportshell
-    print("[5/5] Setting up supportshell SSH + GraphQL token...")
+    # 5. Test SSH and check GraphQL token on supportshell
+    print("[5/6] Setting up supportshell SSH + GraphQL token...")
     ssh_host = f"{user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
-    # Test SSH
-    ssh_test = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host, "echo SSH_OK"],
-        capture_output=True, text=True, timeout=15,
-    )
-    if "SSH_OK" in (ssh_test.stdout or ""):
-        print(f"  SSH to supportshell: OK")
-        # Run redhat-hydra-auth to get GraphQL token
-        auth_result = subprocess.run(
-            ["ssh", ssh_host, "redhat-hydra-auth --production --no-yank 2>&1 || redhat-hydra-auth -p 2>&1; echo AUTH_DONE"],
-            capture_output=True, text=True, timeout=60,
+    try:
+        ssh_test = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host, "echo SSH_OK"],
+            capture_output=True, text=True, timeout=15,
         )
-        if "AUTH_DONE" in (auth_result.stdout or ""):
-            print(f"  GraphQL auth (redhat-hydra-auth): OK")
+        if "SSH_OK" in (ssh_test.stdout or ""):
+            print(f"  SSH to supportshell: OK")
+            # Check if GraphQL token already exists
+            token_check = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=10", ssh_host,
+                 "test -f ~/.cache/hydra-mcp/tokens/redhat-sso-token.json && echo GQL_TOKEN_OK; "
+                 "test -f ~/.yank/oidc-tokens.json && echo YANK_TOKEN_OK"],
+                capture_output=True, text=True, timeout=15,
+            )
+            has_gql = "GQL_TOKEN_OK" in (token_check.stdout or "")
+            has_yank = "YANK_TOKEN_OK" in (token_check.stdout or "")
+            if has_gql:
+                print(f"  GraphQL token: OK")
+            elif has_yank:
+                print(f"  Yank token found (will use as fallback)")
+                print(f"  For best results, run on supportshell: redhat-hydra-auth --production")
+            else:
+                print(f"  GraphQL token: NOT FOUND")
+                print(f"  Run once on supportshell:")
+                print(f"    ssh {ssh_host}")
+                print(f"    redhat-hydra-auth --production")
         else:
-            print(f"  GraphQL auth: needs manual setup")
-            print(f"    Run: ssh {ssh_host}")
-            print(f"    Then: redhat-hydra-auth --production")
-        # Verify token exists
-        token_check = subprocess.run(
-            ["ssh", ssh_host, "test -f ~/.cache/hydra-mcp/tokens/redhat-sso-token.json && echo TOKEN_OK || test -f ~/.yank/oidc-tokens.json && echo TOKEN_OK"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if "TOKEN_OK" in (token_check.stdout or ""):
-            print(f"  GraphQL token: OK")
-        else:
-            print(f"  GraphQL token: not found — run 'redhat-hydra-auth --production' on supportshell")
-    else:
-        print(f"  SSH to supportshell: FAILED")
-        print(f"    Fix: ssh-copy-id {ssh_host}")
-        print(f"    Then re-run: sf-case-poller install")
+            print(f"  SSH to supportshell: FAILED")
+            print(f"    Fix: ssh-copy-id {ssh_host}")
+    except Exception as e:
+        print(f"  SSH check failed: {str(e)[:80]}")
+        print(f"  Ensure SSH works: ssh {ssh_host}")
 
     # 6. Open dashboard in browser
     print("[6/6] Opening dashboard...")
