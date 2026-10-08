@@ -32,12 +32,10 @@ def _get_case_list_url() -> str:
         return env
     try:
         with open(CONFIG_PATH) as f:
-            url = json.load(f).get("case_list_url", "")
-            if url:
-                return url
+            return json.load(f).get("case_list_url", "")
     except Exception:
         pass
-    return "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=Recent"
+    return "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1"
 
 CASE_LIST_URL = _get_case_list_url()
 
@@ -242,24 +240,29 @@ def scrape_cases() -> list[dict]:
         if (rows.length === 0) {
             rows = document.querySelectorAll('[data-row-key-value]');
         }
+
+        // Discover columns dynamically from first row's data-label attributes
+        var columns = [];
+        if (rows.length > 0) {
+            var firstCells = rows[0].querySelectorAll('td, th');
+            for (var fc = 0; fc < firstCells.length; fc++) {
+                var lbl = firstCells[fc].getAttribute('data-label') || '';
+                if (lbl && lbl.length > 0) columns.push(lbl);
+            }
+        }
+
         var cases = [];
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
             var cells = row.querySelectorAll('td, th');
 
-            // Use data-label attribute for reliable column mapping
-            var caseNum = '', status = '', subject = '', owner = '';
-            var severity = '', sbrGroup = '', contactName = '';
+            // Build dynamic field map from data-label
+            var fields = {};
             for (var j = 0; j < cells.length; j++) {
-                var label = (cells[j].getAttribute('data-label') || '').toLowerCase();
-                var val = cells[j].textContent.trim();
-                if (label === 'internal case number') caseNum = val;
-                else if (label === 'status') status = val;
-                else if (label === 'subject') subject = val;
-                else if (label.indexOf('case owner') >= 0) owner = val;
-                else if (label === 'severity') severity = val;
-                else if (label === 'sbr group') sbrGroup = val;
-                else if (label === 'contact name') contactName = val;
+                var label = cells[j].getAttribute('data-label') || '';
+                if (label) {
+                    fields[label] = cells[j].textContent.trim();
+                }
             }
 
             // Get Salesforce record ID from link
@@ -271,18 +274,21 @@ def scrape_cases() -> list[dict]:
             }
             if (!caseId) caseId = row.getAttribute('data-row-key-value') || '';
 
+            // Find case number from known field names
+            var caseNum = fields['Internal Case Number'] || fields['Case Number'] || fields['CaseNumber'] || '';
+
             if (caseNum || caseId) {
                 cases.push({
-                    id: caseId, caseNum: caseNum, status: status,
-                    subject: subject, owner: owner, severity: severity,
-                    sbrGroup: sbrGroup, contactName: contactName,
-                    comments: []
+                    id: caseId,
+                    caseNum: caseNum,
+                    fields: fields
                 });
             }
         }
 
         return JSON.stringify({
             cases: cases,
+            columns: columns,
             url: window.location.href,
             title: document.title,
             count: cases.length
@@ -303,27 +309,26 @@ def scrape_cases() -> list[dict]:
     if "login" in page_url.lower() or "auth" in page_url.lower():
         raise RuntimeError("Session expired — log in to Salesforce in Chrome first")
 
-    log(f"page: {data.get('title', '?')}, cases: {data.get('count', 0)}")
+    columns = data.get("columns", [])
+    log(f"page: {data.get('title', '?')}, cases: {data.get('count', 0)}, columns: {columns}")
 
     cases = []
     for row in data.get("cases", []):
         case_id = row.get("id", "")
         case_num = row.get("caseNum", "")
+        fields = row.get("fields", {})
         if not case_num and not case_id:
             continue
         cases.append({
             "Id": case_id,
             "CaseNumber": case_num,
-            "Status": row.get("status", ""),
-            "Subject": row.get("subject", ""),
-            "Owner": row.get("owner", ""),
-            "Severity": row.get("severity", ""),
-            "SBRGroup": row.get("sbrGroup", ""),
-            "ContactName": row.get("contactName", ""),
+            "Status": fields.get("Status", ""),
+            "Subject": fields.get("Subject", ""),
+            "fields": fields,
             "comments": [],
         })
 
-    return cases
+    return cases, columns
 
 
 def _scrape_case_comments(case_id: str) -> list[dict]:
@@ -403,7 +408,7 @@ def _format_comments(comments: list[dict]) -> str:
 
 def poll_once() -> int:
     try:
-        cases = scrape_cases()
+        cases, columns = scrape_cases()
     except Exception as exc:
         log(f"scrape failed: {exc}")
         return 0
@@ -419,18 +424,15 @@ def poll_once() -> int:
         if not cid:
             continue
         status = rec.get("Status") or ""
+        fields = rec.get("fields") or {}
         comments = rec.get("comments") or []
-        # Track latest comment date to detect new comments
         latest_comment = comments[0].get("date", "") if comments else ""
 
         now_map[cid] = {
             "status": status,
             "number": rec.get("CaseNumber"),
             "subject": rec.get("Subject") or "",
-            "owner": rec.get("Owner") or "",
-            "severity": rec.get("Severity") or "",
-            "sbrGroup": rec.get("SBRGroup") or "",
-            "contactName": rec.get("ContactName") or "",
+            "fields": fields,
             "latestComment": latest_comment,
             "comments": comments[:3],
         }
@@ -485,6 +487,7 @@ def poll_once() -> int:
             sent += 1
 
     state["cases"] = now_map
+    state["columns"] = columns
     state["initialized"] = True
     state["lastRun"] = datetime.now(timezone.utc).isoformat()
     save_state(state)

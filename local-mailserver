@@ -70,11 +70,12 @@ def _check_service(name: str) -> dict:
     return {"running": False, "label": name}
 
 
-def _read_cases() -> list[dict]:
-    """Read current tracked cases from state file."""
+def _read_cases() -> tuple[list[dict], list[str]]:
+    """Read current tracked cases and columns from state file."""
     try:
         with open(STATE_PATH) as f:
             state = json.load(f)
+        columns = state.get("columns", [])
         cases = []
         for cid, info in (state.get("cases") or {}).items():
             cases.append({
@@ -82,13 +83,11 @@ def _read_cases() -> list[dict]:
                 "number": info.get("number", ""),
                 "status": info.get("status", ""),
                 "subject": info.get("subject", ""),
-                "owner": info.get("owner", ""),
-                "severity": info.get("severity", ""),
-                "contactName": info.get("contactName", ""),
+                "fields": info.get("fields", {}),
             })
-        return cases
+        return cases, columns
     except Exception:
-        return []
+        return [], []
 
 
 def _read_state() -> dict:
@@ -114,7 +113,7 @@ def _get_status_data() -> dict:
     chrome = _check_service("chrome")
     mailapp = _check_service("mailapp")
     state = _read_state()
-    cases = _read_cases()
+    cases, columns = _read_cases()
     logs = _last_log_lines(8)
     last_run = state.get("lastRun", "")
     initialized = state.get("initialized", False)
@@ -130,7 +129,7 @@ def _get_status_data() -> dict:
             break
 
     cfg = _read_config()
-    view_url = cfg.get("case_list_url", "")
+    view_url = cfg.get("case_list_url", "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1")
 
     return {
         "poller": poller,
@@ -138,6 +137,7 @@ def _get_status_data() -> dict:
         "mailapp": mailapp,
         "mailserver": {"running": True, "label": "Mail Server"},
         "cases": cases,
+        "columns": columns,
         "case_count": len(cases),
         "email_count": len(EMAILS),
         "last_run": last_run,
@@ -277,14 +277,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div class="logo">SF</div>
   <h1>Notification Center</h1>
 </div>
-<div class="subtitle">Salesforce case status alerts &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
+<div class="subtitle">My Cases (owned by Zakria) &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
 
 <!-- Monitor Settings — top of page -->
 <div class="section-title"><span class="icon">🎯</span> Case View to Monitor</div>
 <div class="config-card">
   <div style="font-size:14px;color:#f8fafc;font-weight:700;margin-bottom:6px">📌 Salesforce List View URL</div>
-  <div class="config-hint">Paste your Salesforce case list view URL below. Open your case list in Chrome, copy the URL, and paste it here.</div>
-  <div class="config-current" style="margin:8px 0">{config_status}</div>
+  <div class="config-hint">Paste your Salesforce case list view URL below. The poller monitors whichever view you set here.</div>
+  <div class="config-current" style="margin:8px 0">Active: <a href="{case_list_url}" target="_blank">{case_list_url}</a></div>
   <div class="config-row">
     <input class="config-input" id="viewUrl" type="text" placeholder="https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=..." value="{case_list_url}">
     <button class="config-save" id="saveBtn" onclick="saveConfig()">💾 Save &amp; Restart</button>
@@ -470,28 +470,55 @@ def _render(data: dict) -> str:
     cr_fix = "" if data["chrome"]["running"] else start_btn("chrome", "▶ Open Chrome")
     ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
 
-    # Cases table
+    # Cases table — dynamically match Salesforce columns
     cases = data["cases"]
+    columns = data.get("columns", [])
+    # Filter out empty/action columns
+    skip_labels = {"", "action", "show actions"}
+    display_cols = [c for c in columns if c.lower() not in skip_labels]
+
     if cases:
+        # Build header
+        header_cells = ""
+        for col in display_cols:
+            header_cells += f"<th>{col}</th>"
+        if not display_cols:
+            header_cells = "<th>Case #</th><th>Status</th><th>Subject</th>"
+
+        # Build rows
         rows = ""
         for c in cases:
             link = f'https://redhatsupport.lightning.force.com/lightning/r/Case/{c["id"]}/view'
-            sev = c.get("severity", "")
-            owner = c.get("owner", "")
-            contact = c.get("contactName", "")
-            rows += (
-                f'<tr>'
-                f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{c["number"]}</span></a></td>'
-                f'<td>{_status_pill(c["status"])}</td>'
-                f'<td style="font-size:12px;color:#94a3b8">{sev}</td>'
-                f'<td style="color:#e2e8f0">{c["subject"][:60]}</td>'
-                f'<td style="color:#60a5fa;font-weight:600">{owner}</td>'
-                f'<td style="color:#94a3b8;font-size:12px">{contact}</td>'
-                f'</tr>'
-            )
+            fields = c.get("fields", {})
+            if display_cols:
+                cells = ""
+                for col in display_cols:
+                    val = fields.get(col, "")
+                    col_lower = col.lower()
+                    if "case number" in col_lower:
+                        cells += f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{val}</span></a></td>'
+                    elif col_lower == "status":
+                        cells += f"<td>{_status_pill(val)}</td>"
+                    elif "subject" in col_lower:
+                        cells += f'<td style="color:#e2e8f0">{val[:70]}</td>'
+                    elif "owner" in col_lower:
+                        cells += f'<td style="color:#60a5fa;font-weight:600">{val}</td>'
+                    elif "severity" in col_lower:
+                        cells += f'<td style="font-size:12px;color:#94a3b8">{val}</td>'
+                    else:
+                        cells += f'<td style="font-size:12px;color:#cbd5e1">{val[:50]}</td>'
+                rows += f"<tr>{cells}</tr>"
+            else:
+                rows += (
+                    f'<tr>'
+                    f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{c["number"]}</span></a></td>'
+                    f'<td>{_status_pill(c["status"])}</td>'
+                    f'<td style="color:#e2e8f0">{c["subject"][:60]}</td>'
+                    f'</tr>'
+                )
         cases_html = (
             '<table class="case-table"><thead><tr>'
-            '<th>Case #</th><th>Status</th><th>Sev</th><th>Subject</th><th>Owner</th><th>Contact</th>'
+            + header_cells +
             '</tr></thead><tbody>' + rows + '</tbody></table>'
         )
     else:
@@ -560,7 +587,6 @@ def _render(data: dict) -> str:
         "{emails_html}": emails_html,
         "{log_html}": log_html,
         "{case_list_url}": data.get("case_list_url", ""),
-        "{config_status}": (f'Active: <a href="{data.get("case_list_url","")}" target="_blank">{data.get("case_list_url","")}</a>' if data.get("case_list_url") else '⚠️ <span style="color:#fbbf24;font-weight:700">No URL configured — paste your Salesforce case list view URL below to start monitoring</span>'),
     }
     for k, v in replacements.items():
         html = html.replace(k, v)
