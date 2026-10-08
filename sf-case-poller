@@ -32,10 +32,12 @@ def _get_case_list_url() -> str:
         return env
     try:
         with open(CONFIG_PATH) as f:
-            return json.load(f).get("case_list_url", "")
+            url = json.load(f).get("case_list_url", "")
+            if url:
+                return url
     except Exception:
         pass
-    return "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1"
+    return "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=Recent"
 
 CASE_LIST_URL = _get_case_list_url()
 

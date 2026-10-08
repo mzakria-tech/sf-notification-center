@@ -130,7 +130,7 @@ def _get_status_data() -> dict:
             break
 
     cfg = _read_config()
-    view_url = cfg.get("case_list_url", "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1")
+    view_url = cfg.get("case_list_url", "")
 
     return {
         "poller": poller,
@@ -277,14 +277,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div class="logo">SF</div>
   <h1>Notification Center</h1>
 </div>
-<div class="subtitle">My Cases (owned by Zakria) &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
+<div class="subtitle">Salesforce case status alerts &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
 
 <!-- Monitor Settings — top of page -->
 <div class="section-title"><span class="icon">🎯</span> Case View to Monitor</div>
 <div class="config-card">
   <div style="font-size:14px;color:#f8fafc;font-weight:700;margin-bottom:6px">📌 Salesforce List View URL</div>
-  <div class="config-hint">Paste your Salesforce case list view URL below. The poller monitors whichever view you set here.</div>
-  <div class="config-current" style="margin:8px 0">Active: <a href="{case_list_url}" target="_blank">{case_list_url}</a></div>
+  <div class="config-hint">Paste your Salesforce case list view URL below. Open your case list in Chrome, copy the URL, and paste it here.</div>
+  <div class="config-current" style="margin:8px 0">{config_status}</div>
   <div class="config-row">
     <input class="config-input" id="viewUrl" type="text" placeholder="https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=..." value="{case_list_url}">
     <button class="config-save" id="saveBtn" onclick="saveConfig()">💾 Save &amp; Restart</button>
@@ -560,6 +560,7 @@ def _render(data: dict) -> str:
         "{emails_html}": emails_html,
         "{log_html}": log_html,
         "{case_list_url}": data.get("case_list_url", ""),
+        "{config_status}": (f'Active: <a href="{data.get("case_list_url","")}" target="_blank">{data.get("case_list_url","")}</a>' if data.get("case_list_url") else '⚠️ <span style="color:#fbbf24;font-weight:700">No URL configured — paste your Salesforce case list view URL below to start monitoring</span>'),
     }
     for k, v in replacements.items():
         html = html.replace(k, v)
