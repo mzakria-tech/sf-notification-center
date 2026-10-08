@@ -134,22 +134,55 @@ echo "╔═══════════════════════�
 echo "║   ✅ Installation complete!                   ║"
 echo "╚═══════════════════════════════════════════════╝"
 echo ""
-echo "  Dependencies installed:"
-echo "    ✓ Homebrew"
-echo "    ✓ Python 3 + pip"
-echo "    ✓ aiosmtpd (Python SMTP library)"
-echo "    ✓ Google Chrome"
-echo "    ✓ Mail.app"
+
+# ── 9. Start all services ────────────────────────────
+echo "→ Starting all services..."
+
+# Start Mail.app if not running
+if ! pgrep -x "Mail" > /dev/null; then
+    echo "  → Opening Mail.app..."
+    open -a Mail
+    sleep 2
+fi
+
+# Start Chrome if not running
+if ! pgrep -x "Google Chrome" > /dev/null; then
+    echo "  → Opening Google Chrome..."
+    open -a "Google Chrome"
+    sleep 3
+fi
+
+# Start mail server (dashboard + SMTP)
+launchctl unload "$LA_DIR/com.mzakria.local-mailserver.plist" 2>/dev/null || true
+sleep 1
+launchctl load "$LA_DIR/com.mzakria.local-mailserver.plist"
+echo "  ✓ Mail Server + Dashboard started (port 8090)"
+
+# Start poller
+launchctl unload "$LA_DIR/com.mzakria.sf-case-poller.plist" 2>/dev/null || true
+sleep 1
+launchctl load "$LA_DIR/com.mzakria.sf-case-poller.plist"
+echo "  ✓ SF Case Poller started (every 5 min)"
+
 echo ""
-echo "  Before starting, make sure:"
-echo "    1. Google Chrome is open & logged into Salesforce"
-echo "    2. Chrome → View → Developer → Allow JavaScript from Apple Events ✓"
-echo "    3. Mail.app is open & configured with your email"
+echo "╔═══════════════════════════════════════════════╗"
+echo "║  🚀 All services running!                    ║"
+echo "╚═══════════════════════════════════════════════╝"
 echo ""
-echo "  Commands:"
-echo "    ./start.sh          — Start all services"
+echo "  Dashboard:  http://localhost:8090"
+echo "  → Open the dashboard and paste your Salesforce"
+echo "    case list view URL to start monitoring."
+echo ""
+echo "  Make sure:"
+echo "    1. Chrome → View → Developer → Allow JavaScript from Apple Events ✓"
+echo "    2. Chrome is logged into Salesforce"
+echo "    3. Mail.app is configured with your email"
+echo ""
+echo "  Other commands:"
 echo "    ./stop.sh           — Stop all services"
 echo "    ./uninstall.sh      — Remove everything"
 echo ""
-echo "  Dashboard:  http://localhost:8090"
-echo "  Logs:       ~/Library/Logs/sf-case-poller.log"
+echo "  Logs: ~/Library/Logs/sf-case-poller.log"
+
+# Open dashboard in browser
+open http://localhost:8090
