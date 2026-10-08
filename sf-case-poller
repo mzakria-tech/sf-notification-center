@@ -143,14 +143,17 @@ tell application "Google Chrome"
         end tell
         delay 15
     else
-        -- Always navigate to the configured view URL
-        set URL of sfTab to "{url}"
-        delay 10
+        -- Only navigate if not already on the correct view
+        set curURL to URL of sfTab
+        if curURL does not contain "{url}" then
+            set URL of sfTab to "{url}"
+            delay 12
+        end if
     end if
     -- Briefly activate SF tab so Chrome renders all virtual rows
     set origIdx to active tab index of sfWin
     set active tab index of sfWin to sfTabIdx
-    delay 3
+    delay 5
     tell sfTab
         set r to {exec_line}
     end tell
@@ -236,22 +239,30 @@ def scrape_cases():
         window.scrollTo(0, 0);
         var tw4 = Date.now(); while (Date.now() - tw4 < 500) {}
 
-        // Wait for rows to appear (up to 8s)
-        var maxWait = 8000, waited = 0;
+        // Wait for rows to appear (up to 15s)
+        var maxWait = 15000, waited = 0;
         while (waited < maxWait) {
             var r = document.querySelectorAll('table tbody tr');
             if (expected > 0 && r.length >= expected) break;
-            if (r.length >= 5 && waited > 3000) break;
-            var t = Date.now(); while (Date.now() - t < 400) {}
-            waited += 400;
+            if (r.length >= 3 && waited > 5000) break;
+            // Re-scroll to trigger virtual rendering
+            if (waited % 2000 === 0) {
+                window.scrollTo(0, document.body.scrollHeight);
+                var rs = Date.now(); while (Date.now() - rs < 200) {}
+                window.scrollTo(0, 0);
+            }
+            var t = Date.now(); while (Date.now() - t < 500) {}
+            waited += 500;
         }
 
+        // Try multiple selectors to find table rows
         var rows = document.querySelectorAll('table tbody tr');
-        if (rows.length === 0) {
-            rows = document.querySelectorAll('[data-row-key-value]');
-        }
+        if (rows.length === 0) rows = document.querySelectorAll('[data-row-key-value]');
+        if (rows.length === 0) rows = document.querySelectorAll('table tr');
+        if (rows.length === 0) rows = document.querySelectorAll('[role="row"]');
+        if (rows.length === 0) rows = document.querySelectorAll('.slds-table tr, .forceListViewManager tr, lightning-datatable tr');
 
-        // Discover columns dynamically from first row's data-label attributes
+        // Discover columns dynamically from data-label or header
         var columns = [];
         if (rows.length > 0) {
             var firstCells = rows[0].querySelectorAll('td, th');
@@ -260,32 +271,71 @@ def scrape_cases():
                 if (lbl && lbl.length > 0) columns.push(lbl);
             }
         }
+        // If no data-label, try getting columns from thead
+        if (columns.length === 0) {
+            var ths = document.querySelectorAll('table thead th, [role="columnheader"]');
+            for (var th = 0; th < ths.length; th++) {
+                var al = ths[th].getAttribute('aria-label') || '';
+                if (al && al.length > 0 && al.length < 50) columns.push(al);
+            }
+        }
 
         var cases = [];
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
+            // Skip header rows
+            if (row.querySelector('th[scope="col"]')) continue;
+            if (row.parentElement && row.parentElement.tagName === 'THEAD') continue;
+
             var cells = row.querySelectorAll('td, th');
 
             // Build dynamic field map from data-label
             var fields = {};
+            var hasDataLabel = false;
             for (var j = 0; j < cells.length; j++) {
                 var label = cells[j].getAttribute('data-label') || '';
                 if (label) {
+                    hasDataLabel = true;
                     fields[label] = cells[j].textContent.trim();
                 }
             }
 
-            // Get Salesforce record ID from link
-            var link = row.querySelector('a[href*="/view"]');
+            // Fallback: map cells to column headers by index
+            if (!hasDataLabel && columns.length > 0) {
+                var ci = 0;
+                for (var j = 0; j < cells.length; j++) {
+                    var val = cells[j].textContent.trim();
+                    if (val && ci < columns.length) {
+                        fields[columns[ci]] = val;
+                        ci++;
+                    }
+                }
+            }
+
+            // Get Salesforce record ID from any link
+            var link = row.querySelector('a[href*="/view"], a[href*="/Case/"]');
             var caseId = '';
             if (link) {
-                var m = link.href.match(/\\/r\\/([a-zA-Z0-9]{15,18})\\/view/);
+                var m = link.href.match(/\\/r\\/([a-zA-Z0-9]{15,18})\\/view/) || link.href.match(/Case\\/([a-zA-Z0-9]{15,18})/);
                 if (m) caseId = m[1];
             }
             if (!caseId) caseId = row.getAttribute('data-row-key-value') || '';
 
-            // Find case number from known field names
-            var caseNum = fields['Internal Case Number'] || fields['Case Number'] || fields['CaseNumber'] || '';
+            // Find case number — try various field name patterns
+            var caseNum = '';
+            for (var key in fields) {
+                if (/case.?number/i.test(key) || /internal.?case/i.test(key)) {
+                    var v = fields[key];
+                    if (/^\\d{5,10}$/.test(v)) { caseNum = v; break; }
+                }
+            }
+            // Last resort: find any 7-8 digit number in the row
+            if (!caseNum) {
+                for (var key in fields) {
+                    var vm = fields[key].match(/\\b(\\d{7,8})\\b/);
+                    if (vm) { caseNum = vm[1]; break; }
+                }
+            }
 
             if (caseNum || caseId) {
                 cases.push({
@@ -296,12 +346,17 @@ def scrape_cases():
             }
         }
 
+        // Debug info
+        var tableCount = document.querySelectorAll('table').length;
+        var allTrCount = document.querySelectorAll('tr').length;
+
         return JSON.stringify({
             cases: cases,
             columns: columns,
             url: window.location.href,
             title: document.title,
-            count: cases.length
+            count: cases.length,
+            debug: {expected: expected, tables: tableCount, allTrs: allTrCount, rowsFound: rows.length}
         });
     })()
     """
@@ -320,7 +375,8 @@ def scrape_cases():
         raise RuntimeError("Session expired — log in to Salesforce in Chrome first")
 
     columns = data.get("columns", [])
-    log(f"page: {data.get('title', '?')}, cases: {data.get('count', 0)}, columns: {columns}")
+    debug = data.get("debug", {})
+    log(f"page: {data.get('title', '?')}, cases: {data.get('count', 0)}, columns: {columns}, debug: {debug}")
 
     cases = []
     for row in data.get("cases", []):
