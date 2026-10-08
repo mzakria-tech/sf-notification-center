@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Poll Salesforce case status via Chrome AppleScript.
+
+Uses the running Chrome's logged-in session directly.
+Runs every INTERVAL seconds, emails on any status change.
+
+State: ~/.local/state/sf-case-status.json
+Log:   ~/Library/Logs/sf-case-poller.log
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import smtplib
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from email.mime.text import MIMEText
+
+INTERVAL = int(os.environ.get("SF_POLL_INTERVAL", "300"))  # 5 min default
+STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
+LOG_PATH = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
+TO_ADDR = os.environ.get("SF_NOTIFY_EMAIL", "mzakria@redhat.com")
+CONFIG_PATH = os.path.expanduser("~/.local/state/sf-poller-config.json")
+
+def _get_case_list_url() -> str:
+    """Read case list URL: env var > config file > default."""
+    env = os.environ.get("SF_CASE_LIST_URL")
+    if env:
+        return env
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f).get("case_list_url", "")
+    except Exception:
+        pass
+    return "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1"
+
+CASE_LIST_URL = _get_case_list_url()
+
+
+def log(msg: str) -> None:
+    line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def send_mail(subject: str, body: str) -> None:
+    # 1. Local SMTP for web UI
+    try:
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = "sf-notify@localhost"
+        msg["To"] = TO_ADDR
+        with smtplib.SMTP("127.0.0.1", 2525, timeout=5) as s:
+            s.send_message(msg)
+    except Exception as exc:
+        log(f"local smtp skipped: {exc}")
+
+    # 2. Real email via macOS Mail.app
+    content = body if body.endswith("\n") else body + "\n"
+    script = f"""
+tell application "Mail"
+  set m to make new outgoing message with properties {{subject:{json.dumps(subject)}, content:{json.dumps(content)}, visible:false}}
+  tell m
+    make new to recipient at end of to recipients with properties {{address:{json.dumps(TO_ADDR)}}}
+  end tell
+  send m
+end tell
+"""
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"Mail.app send failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+
+
+def notify_banner(title: str, body: str) -> None:
+    subprocess.run(
+        ["osascript", "-e",
+         f'display notification {json.dumps(body)} with title {json.dumps(title)}'],
+        check=False,
+    )
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {"cases": {}, "initialized": False}
+    with open(STATE_PATH, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def chrome_js(js_code: str, url: str | None = None) -> str:
+    """Execute JavaScript in Chrome via AppleScript. Returns the result as string."""
+    import base64
+    import tempfile
+
+    # Base64 encode the JS to avoid quote escaping issues
+    b64 = base64.b64encode(js_code.encode("utf-8")).decode("ascii")
+    exec_line = f'execute javascript "eval(atob(\'{b64}\'))"'
+
+    if url:
+        ascript = f'''
+tell application "Google Chrome"
+    set sfTab to missing value
+    set sfWin to missing value
+    set sfTabIdx to 0
+    repeat with w in windows
+        repeat with i from 1 to count of tabs of w
+            set t to tab i of w
+            if URL of t contains "lightning" and URL of t contains "redhatsupport" then
+                set sfTab to t
+                set sfWin to w
+                set sfTabIdx to i
+                exit repeat
+            end if
+        end repeat
+        if sfTab is not missing value then exit repeat
+    end repeat
+    if sfTab is missing value then
+        tell window 1
+            set sfTab to make new tab with properties {{URL:"{url}"}}
+            set sfWin to window 1
+            set sfTabIdx to (count of tabs of window 1)
+        end tell
+        delay 15
+    else
+        set curURL to URL of sfTab
+        if curURL does not contain "Case/list" then
+            set URL of sfTab to "{url}"
+            delay 12
+        end if
+    end if
+    -- Briefly activate SF tab so Chrome renders all virtual rows
+    set origIdx to active tab index of sfWin
+    set active tab index of sfWin to sfTabIdx
+    delay 3
+    tell sfTab
+        set r to {exec_line}
+    end tell
+    -- Restore user's original tab
+    set active tab index of sfWin to origIdx
+    return r
+end tell
+'''
+    else:
+        ascript = f'''
+tell application "Google Chrome"
+    set sfTab to missing value
+    repeat with w in windows
+        repeat with t in tabs of w
+            if URL of t starts with "https://redhatsupport" then
+                set sfTab to t
+                exit repeat
+            end if
+        end repeat
+        if sfTab is not missing value then exit repeat
+    end repeat
+    if sfTab is missing value then
+        return "ERROR:NO_SF_TAB"
+    end if
+    tell sfTab
+        set r to {exec_line}
+    end tell
+    return r
+end tell
+'''
+
+    # Write AppleScript to temp file to avoid shell quoting issues
+    fd, path = tempfile.mkstemp(suffix=".applescript")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(ascript)
+        r = subprocess.run(
+            ["osascript", path],
+            capture_output=True, text=True, timeout=45,
+        )
+    finally:
+        os.unlink(path)
+
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()
+        raise RuntimeError(f"AppleScript failed: {err[:300]}")
+    return (r.stdout or "").strip()
+
+
+def scrape_cases() -> list[dict]:
+    """Navigate Chrome to the case list, extract cases + recent comments via JS."""
+    js = """
+    (function() {
+        // Get expected row count from the header (e.g. "18 items")
+        var expected = 0;
+        var allEls = document.querySelectorAll('span, div, p');
+        for (var hh = 0; hh < allEls.length; hh++) {
+            var ht = allEls[hh].textContent || '';
+            var em = ht.match(/(\\d+)\\s+items?/i);
+            if (em && ht.length < 150) { expected = parseInt(em[1]); break; }
+        }
+
+        // Scroll through the table to force all virtual rows to render
+        var scrollContainers = document.querySelectorAll('.uiScroller, .slds-scrollable_y, .slds-scrollable, [role="grid"], .listViewContent');
+        for (var si = 0; si < scrollContainers.length; si++) {
+            var sc = scrollContainers[si];
+            if (sc.scrollHeight > sc.clientHeight) {
+                for (var step = 0; step < 20; step++) {
+                    sc.scrollTop = step * 200;
+                    var tw = Date.now(); while (Date.now() - tw < 150) {}
+                }
+                sc.scrollTop = 0;
+                var tw2 = Date.now(); while (Date.now() - tw2 < 300) {}
+            }
+        }
+        // Also scroll main page
+        for (var ps = 0; ps < 10; ps++) {
+            window.scrollTo(0, ps * 300);
+            var tw3 = Date.now(); while (Date.now() - tw3 < 150) {}
+        }
+        window.scrollTo(0, 0);
+        var tw4 = Date.now(); while (Date.now() - tw4 < 500) {}
+
+        // Wait for rows to appear (up to 8s)
+        var maxWait = 8000, waited = 0;
+        while (waited < maxWait) {
+            var r = document.querySelectorAll('table tbody tr');
+            if (expected > 0 && r.length >= expected) break;
+            if (r.length >= 5 && waited > 3000) break;
+            var t = Date.now(); while (Date.now() - t < 400) {}
+            waited += 400;
+        }
+
+        var rows = document.querySelectorAll('table tbody tr');
+        if (rows.length === 0) {
+            rows = document.querySelectorAll('[data-row-key-value]');
+        }
+        var cases = [];
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            var cells = row.querySelectorAll('td, th');
+
+            // Use data-label attribute for reliable column mapping
+            var caseNum = '', status = '', subject = '', owner = '';
+            var severity = '', sbrGroup = '', contactName = '';
+            for (var j = 0; j < cells.length; j++) {
+                var label = (cells[j].getAttribute('data-label') || '').toLowerCase();
+                var val = cells[j].textContent.trim();
+                if (label === 'internal case number') caseNum = val;
+                else if (label === 'status') status = val;
+                else if (label === 'subject') subject = val;
+                else if (label.indexOf('case owner') >= 0) owner = val;
+                else if (label === 'severity') severity = val;
+                else if (label === 'sbr group') sbrGroup = val;
+                else if (label === 'contact name') contactName = val;
+            }
+
+            // Get Salesforce record ID from link
+            var link = row.querySelector('a[href*="/view"]');
+            var caseId = '';
+            if (link) {
+                var m = link.href.match(/\\/r\\/([a-zA-Z0-9]{15,18})\\/view/);
+                if (m) caseId = m[1];
+            }
+            if (!caseId) caseId = row.getAttribute('data-row-key-value') || '';
+
+            if (caseNum || caseId) {
+                cases.push({
+                    id: caseId, caseNum: caseNum, status: status,
+                    subject: subject, owner: owner, severity: severity,
+                    sbrGroup: sbrGroup, contactName: contactName,
+                    comments: []
+                });
+            }
+        }
+
+        return JSON.stringify({
+            cases: cases,
+            url: window.location.href,
+            title: document.title,
+            count: cases.length
+        });
+    })()
+    """
+    result = chrome_js(js, url=CASE_LIST_URL)
+    if not result or result.startswith("ERROR:"):
+        raise RuntimeError(f"Chrome JS returned: {result}")
+
+    try:
+        data = json.loads(result)
+    except json.JSONDecodeError:
+        log(f"JS returned non-JSON: {result[:200]}")
+        raise RuntimeError("Could not parse case list data from Chrome")
+
+    page_url = data.get("url", "")
+    if "login" in page_url.lower() or "auth" in page_url.lower():
+        raise RuntimeError("Session expired — log in to Salesforce in Chrome first")
+
+    log(f"page: {data.get('title', '?')}, cases: {data.get('count', 0)}")
+
+    cases = []
+    for row in data.get("cases", []):
+        case_id = row.get("id", "")
+        case_num = row.get("caseNum", "")
+        if not case_num and not case_id:
+            continue
+        cases.append({
+            "Id": case_id,
+            "CaseNumber": case_num,
+            "Status": row.get("status", ""),
+            "Subject": row.get("subject", ""),
+            "Owner": row.get("owner", ""),
+            "Severity": row.get("severity", ""),
+            "SBRGroup": row.get("sbrGroup", ""),
+            "ContactName": row.get("contactName", ""),
+            "comments": [],
+        })
+
+    return cases
+
+
+def _scrape_case_comments(case_id: str) -> list[dict]:
+    """Navigate Chrome to the case detail page and extract recent comments from DOM."""
+    case_url = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{case_id}/view"
+    js = """
+    (function() {
+        var comments = [];
+        // Look for feed items / case comments in the Lightning page
+        var feedItems = document.querySelectorAll(
+            '.cuf-feedItem, .feedItemBody, [data-aura-class*="feed"], .slds-feed__item, .forceChatterFeedBody'
+        );
+        for (var i = 0; i < feedItems.length && i < 5; i++) {
+            var item = feedItems[i];
+            var bodyEl = item.querySelector('.feedItemText, .cuf-feedBodyText, .slds-post__content, p, .messageBody');
+            var authorEl = item.querySelector('.feedItemAuthor, .cuf-feedItemAuthor, .slds-publisher__toggle-visibility, a[data-aura-class*="user"]');
+            var dateEl = item.querySelector('.feedItemTimestamp, .cuf-feedItemTimestamp, time, .timeStamp');
+            var body = bodyEl ? bodyEl.textContent.trim() : item.textContent.trim().substring(0, 500);
+            var author = authorEl ? authorEl.textContent.trim() : '';
+            var date = dateEl ? (dateEl.getAttribute('datetime') || dateEl.textContent.trim()) : '';
+            if (body && body.length > 5) {
+                comments.push({
+                    body: body.substring(0, 500),
+                    author: author,
+                    date: date,
+                    isPublic: true
+                });
+            }
+        }
+
+        // Also try generic text blocks that look like comments
+        if (comments.length === 0) {
+            var panels = document.querySelectorAll('.slds-card, .forceRelatedListSingleContainer');
+            for (var p = 0; p < panels.length; p++) {
+                var header = panels[p].querySelector('h2, .slds-card__header-title');
+                if (header && /comment/i.test(header.textContent)) {
+                    var items = panels[p].querySelectorAll('li, tr, .slds-item');
+                    for (var j = 0; j < items.length && j < 5; j++) {
+                        comments.push({
+                            body: items[j].textContent.trim().substring(0, 500),
+                            author: '',
+                            date: '',
+                            isPublic: true
+                        });
+                    }
+                }
+            }
+        }
+
+        return JSON.stringify(comments);
+    })()
+    """
+    result = chrome_js(js, url=case_url)
+    if not result or result.startswith("ERROR:"):
+        return []
+    try:
+        return json.loads(result)[:5]
+    except json.JSONDecodeError:
+        return []
+
+
+def _format_comments(comments: list[dict]) -> str:
+    """Format comments for email body."""
+    if not comments:
+        return ""
+    lines = ["\n--- Recent Comments ---"]
+    for c in comments:
+        author = c.get("author", "Unknown")
+        date = (c.get("date") or "")[:16].replace("T", " ")
+        pub = "Public" if c.get("isPublic") else "Private"
+        body = (c.get("body") or "").strip()
+        if body:
+            lines.append(f"\n[{pub}] {author} ({date}):")
+            lines.append(body[:300])
+    return "\n".join(lines)
+
+
+def poll_once() -> int:
+    try:
+        cases = scrape_cases()
+    except Exception as exc:
+        log(f"scrape failed: {exc}")
+        return 0
+
+    state = load_state()
+    prev = state.get("cases") or {}
+    initialized = bool(state.get("initialized"))
+    now_map = {}
+    sent = 0
+
+    for rec in cases:
+        cid = rec.get("Id") or rec.get("CaseNumber") or ""
+        if not cid:
+            continue
+        status = rec.get("Status") or ""
+        comments = rec.get("comments") or []
+        # Track latest comment date to detect new comments
+        latest_comment = comments[0].get("date", "") if comments else ""
+
+        now_map[cid] = {
+            "status": status,
+            "number": rec.get("CaseNumber"),
+            "subject": rec.get("Subject") or "",
+            "owner": rec.get("Owner") or "",
+            "severity": rec.get("Severity") or "",
+            "sbrGroup": rec.get("SBRGroup") or "",
+            "contactName": rec.get("ContactName") or "",
+            "latestComment": latest_comment,
+            "comments": comments[:3],
+        }
+
+        old_entry = prev.get(cid) or {}
+        old_status = old_entry.get("status")
+        old_comment_date = old_entry.get("latestComment", "")
+        num = rec.get("CaseNumber") or cid
+        subj = rec.get("Subject") or ""
+        link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
+        comment_text = _format_comments(comments)
+
+        if not initialized:
+            continue
+
+        # Check for status change
+        if old_status is not None and old_status.strip().lower() != status.strip().lower():
+            title = f"Case {num}: {old_status} → {status}"
+            body = (
+                f"Salesforce case {num} status changed.\n"
+                f"From: {old_status}\n"
+                f"To: {status}\n"
+                f"Subject: {subj}\n"
+                f"{link}\n"
+                f"{comment_text}\n"
+            )
+            notify_banner("Salesforce", title)
+            try:
+                send_mail(title, body)
+                log(f"emailed {num} (status change)")
+            except Exception as exc:
+                log(f"mail failed {num}: {exc}")
+            sent += 1
+
+        # Check for new comment (different latest comment date)
+        elif old_comment_date and latest_comment and latest_comment != old_comment_date:
+            title = f"Case {num}: New comment"
+            author = comments[0].get("author", "Someone") if comments else "Someone"
+            body = (
+                f"New comment on case {num}.\n"
+                f"Status: {status}\n"
+                f"Subject: {subj}\n"
+                f"{link}\n"
+                f"{comment_text}\n"
+            )
+            notify_banner("Salesforce", f"{num}: New comment by {author}")
+            try:
+                send_mail(title, body)
+                log(f"emailed {num} (new comment)")
+            except Exception as exc:
+                log(f"mail failed {num}: {exc}")
+            sent += 1
+
+    state["cases"] = now_map
+    state["initialized"] = True
+    state["lastRun"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
+    log(f"ok cases={len(now_map)} mailed={sent} init_was={initialized}")
+    return 0
+
+
+def main() -> int:
+    log(f"starting — interval={INTERVAL}s url={CASE_LIST_URL}")
+
+    if "--once" in sys.argv:
+        return poll_once()
+
+    while True:
+        try:
+            poll_once()
+        except Exception as exc:
+            log(f"poll error: {exc}")
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("stopped")
+    except Exception as exc:
+        log(f"fatal: {exc}")
+        sys.exit(1)

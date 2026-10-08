@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""SF Notification Center — Web dashboard + local SMTP.
+
+SMTP on port 2525, Web UI on port 8090.
+Shows live service health, tracked cases, and email notifications.
+"""
+
+import asyncio
+import json
+import os
+import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime, timezone
+from aiosmtpd.controller import Controller
+from aiosmtpd.handlers import Message
+
+EMAILS = []
+STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
+CONFIG_PATH = os.path.expanduser("~/.local/state/sf-poller-config.json")
+POLLER_LOG = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
+
+
+def _read_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(cfg: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+class MailHandler(Message):
+    def handle_message(self, message):
+        entry = {
+            "id": len(EMAILS) + 1,
+            "from": message.get("From", ""),
+            "to": message.get("To", ""),
+            "subject": message.get("Subject", "(no subject)"),
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "body": message.get_payload(decode=True).decode("utf-8", errors="replace")
+                    if not message.is_multipart()
+                    else str(message.get_payload()),
+        }
+        EMAILS.insert(0, entry)
+        if len(EMAILS) > 100:
+            EMAILS[:] = EMAILS[:100]
+        print(f"[MAIL] {entry['date']}  Subject: {entry['subject']}")
+
+
+def _check_service(name: str) -> dict:
+    """Check if a service is running."""
+    if name == "poller":
+        r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        running = "com.mzakria.sf-case-poller" in (r.stdout or "")
+        return {"running": running, "label": "SF Case Poller"}
+    elif name == "mailserver":
+        return {"running": True, "label": "Mail Server"}
+    elif name == "chrome":
+        r = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
+        return {"running": r.returncode == 0, "label": "Google Chrome"}
+    elif name == "mailapp":
+        r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
+        return {"running": r.returncode == 0, "label": "Mail.app"}
+    return {"running": False, "label": name}
+
+
+def _read_cases() -> list[dict]:
+    """Read current tracked cases from state file."""
+    try:
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+        cases = []
+        for cid, info in (state.get("cases") or {}).items():
+            cases.append({
+                "id": cid,
+                "number": info.get("number", ""),
+                "status": info.get("status", ""),
+                "subject": info.get("subject", ""),
+                "owner": info.get("owner", ""),
+                "severity": info.get("severity", ""),
+                "contactName": info.get("contactName", ""),
+            })
+        return cases
+    except Exception:
+        return []
+
+
+def _read_state() -> dict:
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _last_log_lines(n=5) -> list[str]:
+    try:
+        with open(POLLER_LOG) as f:
+            lines = f.readlines()
+        return [l.strip() for l in lines[-n:]]
+    except Exception:
+        return []
+
+
+def _get_status_data() -> dict:
+    """Gather all live status data."""
+    poller = _check_service("poller")
+    chrome = _check_service("chrome")
+    mailapp = _check_service("mailapp")
+    state = _read_state()
+    cases = _read_cases()
+    logs = _last_log_lines(8)
+    last_run = state.get("lastRun", "")
+    initialized = state.get("initialized", False)
+
+    # Parse last log for scrape status
+    last_scrape = "unknown"
+    for line in reversed(logs):
+        if "cases=" in line:
+            last_scrape = "success"
+            break
+        elif "scrape failed" in line:
+            last_scrape = "failed"
+            break
+
+    cfg = _read_config()
+    view_url = cfg.get("case_list_url", "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1")
+
+    return {
+        "poller": poller,
+        "chrome": chrome,
+        "mailapp": mailapp,
+        "mailserver": {"running": True, "label": "Mail Server"},
+        "cases": cases,
+        "case_count": len(cases),
+        "email_count": len(EMAILS),
+        "last_run": last_run,
+        "initialized": initialized,
+        "last_scrape": last_scrape,
+        "logs": logs,
+        "emails": EMAILS[:20],
+        "case_list_url": view_url,
+    }
+
+
+DASHBOARD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SF Notification Center</title>
+<meta http-equiv="refresh" content="15">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0f172a 0%,#1a1a2e 50%,#16213e 100%);color:#e2e8f0;min-height:100vh}
+.container{max-width:1000px;margin:0 auto;padding:24px}
+
+/* Header */
+.header{display:flex;align-items:center;gap:16px;margin-bottom:6px}
+.logo{width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:900;font-size:20px;box-shadow:0 4px 15px rgba(59,130,246,0.4)}
+.header h1{font-size:28px;font-weight:800;background:linear-gradient(90deg,#3b82f6,#a855f7,#ec4899);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.subtitle{color:#94a3b8;font-size:13px;margin-bottom:22px}
+
+/* Service grid */
+.svc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+.svc{background:#1e293b;border-radius:10px;padding:14px;text-align:center;position:relative;overflow:hidden;border:1px solid #334155;transition:transform 0.2s,box-shadow 0.2s}
+.svc:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,0.3)}
+.svc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.svc.blue::before{background:linear-gradient(90deg,#3b82f6,#60a5fa)}
+.svc.purple::before{background:linear-gradient(90deg,#8b5cf6,#a855f7)}
+.svc.green::before{background:linear-gradient(90deg,#22c55e,#4ade80)}
+.svc.pink::before{background:linear-gradient(90deg,#ec4899,#f472b6)}
+.svc-icon{font-size:28px;margin-bottom:6px}
+.svc-label{font-size:12px;font-weight:600;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px}
+.svc-status{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;text-transform:uppercase;padding:3px 10px;border-radius:20px}
+.svc-status.on{background:rgba(34,197,94,0.15);color:#4ade80}
+.svc-status.off{background:rgba(239,68,68,0.15);color:#f87171}
+.dot{width:7px;height:7px;border-radius:50%}
+.dot.on{background:#4ade80;box-shadow:0 0 8px #22c55e80;animation:pulse 2s infinite}
+.dot.off{background:#f87171;box-shadow:0 0 8px #ef444480}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+.fix-cmd{margin-top:8px;background:#0f172a;border-radius:6px;padding:6px 10px;font-family:'SF Mono',Menlo,monospace;font-size:10px;color:#f87171;border:1px solid #7f1d1d;text-align:left;cursor:pointer;position:relative;word-break:break-all}
+.fix-cmd:hover{border-color:#f87171}
+.fix-cmd::before{content:'⚠ Fix: ';font-weight:700;color:#fbbf24}
+.fix-cmd .copy-hint{position:absolute;right:6px;top:6px;font-size:9px;color:#475569;font-family:sans-serif}
+.start-btn{margin-top:8px;background:linear-gradient(135deg,#22c55e,#16a34a);border:none;border-radius:6px;padding:8px 16px;color:#fff;font-weight:700;font-size:12px;cursor:pointer;width:100%;transition:all 0.2s;text-transform:uppercase;letter-spacing:0.5px}
+.start-btn:hover{background:linear-gradient(135deg,#4ade80,#22c55e);transform:scale(1.02);box-shadow:0 4px 15px rgba(34,197,94,0.4)}
+.start-btn:active{transform:scale(0.98)}
+.start-btn.loading{background:#475569;cursor:wait}
+.start-btn.done{background:linear-gradient(135deg,#3b82f6,#2563eb)}
+
+/* Stats row */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+.stat{background:#1e293b;border-radius:10px;padding:14px 16px;border:1px solid #334155}
+.stat-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.stat-val{font-size:22px;font-weight:800}
+.stat-val.blue{color:#3b82f6}
+.stat-val.purple{color:#a855f7}
+.stat-val.green{color:#22c55e}
+.stat-val.orange{color:#f97316}
+.stat-sub{font-size:11px;color:#64748b;margin-top:2px}
+
+/* Cases table */
+.section-title{font-size:18px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.section-title .icon{font-size:20px}
+.case-table{width:100%;border-collapse:collapse;margin-bottom:22px}
+.case-table th{background:#1e293b;padding:10px 14px;text-align:left;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;border-bottom:2px solid #334155}
+.case-table td{padding:10px 14px;font-size:13px;border-bottom:1px solid #1e293b}
+.case-table tr:hover td{background:rgba(59,130,246,0.05)}
+.case-num{color:#3b82f6;font-weight:700;font-family:'SF Mono',Menlo,monospace}
+.case-link{color:#3b82f6;text-decoration:none}
+.case-link:hover{text-decoration:underline}
+.status-pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase}
+.status-pill.inprogress{background:rgba(59,130,246,0.15);color:#60a5fa}
+.status-pill.waiting-rh{background:rgba(249,115,22,0.15);color:#fb923c}
+.status-pill.waiting-cust{background:rgba(168,85,247,0.15);color:#c084fc}
+.status-pill.closed{background:rgba(100,116,139,0.15);color:#94a3b8}
+.status-pill.new{background:rgba(34,197,94,0.15);color:#4ade80}
+.status-pill.default{background:rgba(148,163,184,0.1);color:#94a3b8}
+
+/* Flow steps */
+.flow{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}
+.flow-step{display:flex;align-items:center;gap:8px;background:#1e293b;border-radius:8px;padding:10px 14px;flex:1;min-width:170px;border:1px solid #334155}
+.flow-num{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:12px;flex-shrink:0}
+.flow-text{font-size:12px;color:#cbd5e1}
+.flow-arrow{color:#334155;font-size:18px;display:flex;align-items:center}
+
+/* Email notifications */
+.email-card{background:#1e293b;border-radius:10px;padding:14px 18px;margin-bottom:10px;border:1px solid #334155;border-left:3px solid #3b82f6;transition:all 0.2s}
+.email-card:hover{border-left-color:#a855f7;transform:translateX(3px)}
+.email-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.email-subj{font-weight:600;font-size:14px;color:#f8fafc}
+.email-date{font-size:11px;color:#475569;font-family:'SF Mono',Menlo,monospace}
+.email-from{font-size:12px;color:#64748b;margin-bottom:4px}
+.email-body{font-size:12px;color:#94a3b8;white-space:pre-wrap;max-height:60px;overflow:hidden;font-family:'SF Mono',Menlo,monospace}
+.badge{background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:#fff;font-size:11px;font-weight:700;padding:2px 10px;border-radius:12px}
+.empty{text-align:center;padding:40px 20px;color:#475569;background:#1e293b;border-radius:10px;border:1px dashed #334155}
+.empty-icon{font-size:36px;margin-bottom:8px}
+
+/* Activity log */
+.log-box{background:#0f172a;border-radius:8px;padding:12px;font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#64748b;max-height:180px;overflow-y:auto;border:1px solid #1e293b;margin-bottom:22px}
+.log-line{padding:2px 0;border-bottom:1px solid #1e293b0a}
+.log-line .ts{color:#475569}
+.log-line .ok{color:#4ade80}
+.log-line .err{color:#f87171}
+.log-line .info{color:#60a5fa}
+
+/* Config section */
+.config-card{background:#1e293b;border-radius:10px;padding:18px;margin-bottom:22px;border:1px solid #334155}
+.config-row{display:flex;gap:10px;align-items:center;margin-top:10px}
+.config-input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px 14px;color:#e2e8f0;font-size:13px;font-family:'SF Mono',Menlo,monospace;outline:none;transition:border 0.2s}
+.config-input:focus{border-color:#3b82f6}
+.config-save{background:linear-gradient(135deg,#3b82f6,#2563eb);border:none;border-radius:6px;padding:10px 20px;color:#fff;font-weight:700;font-size:12px;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;transition:all 0.2s;white-space:nowrap}
+.config-save:hover{background:linear-gradient(135deg,#60a5fa,#3b82f6);box-shadow:0 4px 15px rgba(59,130,246,0.4)}
+.config-save.saving{background:#475569;cursor:wait}
+.config-save.saved{background:linear-gradient(135deg,#22c55e,#16a34a)}
+.config-hint{font-size:11px;color:#64748b;margin-top:6px}
+.config-current{font-size:11px;color:#94a3b8;margin-top:4px;word-break:break-all}
+.config-current a{color:#3b82f6;text-decoration:none}
+.config-current a:hover{text-decoration:underline}
+
+.footer{text-align:center;margin-top:20px;padding:14px;font-size:11px;color:#334155;border-top:1px solid #1e293b}
+
+@media(max-width:700px){.svc-grid,.stats{grid-template-columns:repeat(2,1fr)}.flow{flex-direction:column}.flow-arrow{display:none}}
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <div class="logo">SF</div>
+  <h1>Notification Center</h1>
+</div>
+<div class="subtitle">My Cases (owned by Zakria) &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
+
+<!-- Service Health -->
+<div class="svc-grid">
+  <div class="svc blue">
+    <div class="svc-icon">📮</div>
+    <div class="svc-label">Mail Server</div>
+    <div class="svc-status {ms_cls}"><div class="dot {ms_cls}"></div>{ms_text}</div>
+    {ms_fix}
+  </div>
+  <div class="svc purple">
+    <div class="svc-icon">🔄</div>
+    <div class="svc-label">SF Poller</div>
+    <div class="svc-status {pl_cls}"><div class="dot {pl_cls}"></div>{pl_text}</div>
+    {pl_fix}
+  </div>
+  <div class="svc green">
+    <div class="svc-icon">🌐</div>
+    <div class="svc-label">Chrome</div>
+    <div class="svc-status {cr_cls}"><div class="dot {cr_cls}"></div>{cr_text}</div>
+    {cr_fix}
+  </div>
+  <div class="svc pink">
+    <div class="svc-icon">✉️</div>
+    <div class="svc-label">Mail.app</div>
+    <div class="svc-status {ma_cls}"><div class="dot {ma_cls}"></div>{ma_text}</div>
+    {ma_fix}
+  </div>
+</div>
+
+<!-- Stats -->
+<div class="stats">
+  <div class="stat">
+    <div class="stat-label">Cases Tracked</div>
+    <div class="stat-val blue">{case_count}</div>
+    <div class="stat-sub">My Cases — owned by me</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Emails Sent</div>
+    <div class="stat-val purple">{email_count}</div>
+    <div class="stat-sub">status change alerts</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Last Poll</div>
+    <div class="stat-val green" style="font-size:14px">{last_run}</div>
+    <div class="stat-sub">{scrape_status}</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Sends To</div>
+    <div class="stat-val orange" style="font-size:13px">mzakria@redhat.com</div>
+    <div class="stat-sub">via Mail.app + local SMTP</div>
+  </div>
+</div>
+
+<!-- Tracked Cases -->
+<div class="section-title"><span class="icon">📋</span> Tracked Cases</div>
+{cases_html}
+
+<!-- How it works -->
+<div class="section-title"><span class="icon">⚡</span> How It Works</div>
+<div class="flow">
+  <div class="flow-step"><div class="flow-num" style="background:#3b82f6">1</div><div class="flow-text">Chrome reads Salesforce case list</div></div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step"><div class="flow-num" style="background:#8b5cf6">2</div><div class="flow-text">Compares status with last poll</div></div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step"><div class="flow-num" style="background:#22c55e">3</div><div class="flow-text">Sends email + macOS banner</div></div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step"><div class="flow-num" style="background:#f97316">4</div><div class="flow-text">Shows here in dashboard</div></div>
+</div>
+
+<!-- Settings -->
+<div class="section-title"><span class="icon">⚙️</span> Monitor Settings</div>
+<div class="config-card">
+  <div style="font-size:13px;color:#cbd5e1;font-weight:600">Salesforce List View URL</div>
+  <div class="config-hint">Paste a Salesforce list view URL to change which cases are monitored. The poller will restart automatically.</div>
+  <div class="config-current">Currently: <a href="{case_list_url}" target="_blank">{case_list_url}</a></div>
+  <div class="config-row">
+    <input class="config-input" id="viewUrl" type="text" placeholder="https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=..." value="{case_list_url}">
+    <button class="config-save" id="saveBtn" onclick="saveConfig()">💾 Save &amp; Restart</button>
+  </div>
+</div>
+
+<!-- Email Notifications -->
+<div class="section-title" style="justify-content:space-between">
+  <span><span class="icon">🔔</span> Notifications</span>
+  <span class="badge">{email_count}</span>
+</div>
+{emails_html}
+
+<!-- Activity Log -->
+<div class="section-title" style="margin-top:22px"><span class="icon">📜</span> Activity Log</div>
+<div class="log-box">{log_html}</div>
+
+</div>
+<div class="footer">SF Notification Center &bull; Mahammad Zakria &bull; Red Hat OpenShift Support</div>
+<script>
+function saveConfig() {
+    var btn = document.getElementById('saveBtn');
+    var url = document.getElementById('viewUrl').value.trim();
+    if (!url || !url.includes('lightning')) {
+        alert('Please enter a valid Salesforce Lightning list view URL');
+        return;
+    }
+    btn.textContent = 'Saving...';
+    btn.classList.add('saving');
+    fetch('/api/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({case_list_url: url})
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.ok) {
+            btn.textContent = '✓ Saved!';
+            btn.classList.remove('saving');
+            btn.classList.add('saved');
+            setTimeout(() => location.reload(), 3000);
+        } else {
+            btn.textContent = '✗ ' + d.msg;
+            btn.classList.remove('saving');
+        }
+    })
+    .catch(() => {
+        btn.textContent = '✗ Error';
+        btn.classList.remove('saving');
+    });
+}
+
+function startService(svc, btn) {
+    btn.textContent = 'Starting...';
+    btn.classList.add('loading');
+    fetch('/api/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({service: svc})
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.ok) {
+            btn.textContent = '✓ Started!';
+            btn.classList.remove('loading');
+            btn.classList.add('done');
+            setTimeout(() => location.reload(), 2000);
+        } else {
+            btn.textContent = '✗ Failed: ' + d.msg;
+            btn.classList.remove('loading');
+        }
+    })
+    .catch(() => {
+        btn.textContent = '✗ Error';
+        btn.classList.remove('loading');
+    });
+}
+</script>
+</body>
+</html>"""
+
+
+def _status_pill(status: str) -> str:
+    s = status.lower()
+    if "in progress" in s:
+        cls = "inprogress"
+    elif "waiting on red hat" in s:
+        cls = "waiting-rh"
+    elif "waiting on customer" in s or "customer responded" in s:
+        cls = "waiting-cust"
+    elif "closed" in s:
+        cls = "closed"
+    elif "new" in s:
+        cls = "new"
+    else:
+        cls = "default"
+    return f'<span class="status-pill {cls}">{status}</span>'
+
+
+def _render(data: dict) -> str:
+    def svc(d):
+        return ("on", "Running") if d["running"] else ("off", "Stopped")
+
+    ms_cls, ms_text = svc(data["mailserver"])
+    pl_cls, pl_text = svc(data["poller"])
+    cr_cls, cr_text = svc(data["chrome"])
+    ma_cls, ma_text = svc(data["mailapp"])
+
+    # Start buttons for stopped services
+    def start_btn(svc_id, label="▶ Start"):
+        return f'<button class="start-btn" onclick="startService(\'{svc_id}\', this)">{label}</button>'
+
+    ms_fix = "" if data["mailserver"]["running"] else start_btn("mailserver", "▶ Start Mail Server")
+    pl_fix = "" if data["poller"]["running"] else start_btn("poller", "▶ Start Poller")
+    cr_fix = "" if data["chrome"]["running"] else start_btn("chrome", "▶ Open Chrome")
+    ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
+
+    # Cases table
+    cases = data["cases"]
+    if cases:
+        rows = ""
+        for c in cases:
+            link = f'https://redhatsupport.lightning.force.com/lightning/r/Case/{c["id"]}/view'
+            sev = c.get("severity", "")
+            owner = c.get("owner", "")
+            contact = c.get("contactName", "")
+            rows += (
+                f'<tr>'
+                f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{c["number"]}</span></a></td>'
+                f'<td>{_status_pill(c["status"])}</td>'
+                f'<td style="font-size:12px;color:#94a3b8">{sev}</td>'
+                f'<td style="color:#e2e8f0">{c["subject"][:60]}</td>'
+                f'<td style="color:#60a5fa;font-weight:600">{owner}</td>'
+                f'<td style="color:#94a3b8;font-size:12px">{contact}</td>'
+                f'</tr>'
+            )
+        cases_html = (
+            '<table class="case-table"><thead><tr>'
+            '<th>Case #</th><th>Status</th><th>Sev</th><th>Subject</th><th>Owner</th><th>Contact</th>'
+            '</tr></thead><tbody>' + rows + '</tbody></table>'
+        )
+    else:
+        cases_html = '<div class="empty"><div class="empty-icon">📭</div>No cases tracked yet — waiting for first successful poll</div>'
+
+    # Emails
+    emails = data["emails"]
+    if emails:
+        cards = ""
+        for e in emails:
+            body = (e.get("body") or "")[:200].replace("<", "&lt;")
+            cards += (
+                f'<div class="email-card">'
+                f'<div class="email-top"><span class="email-subj">{e["subject"]}</span>'
+                f'<span class="email-date">{e["date"]}</span></div>'
+                f'<div class="email-from">To: {e.get("to","")}</div>'
+                f'<div class="email-body">{body}</div></div>'
+            )
+        emails_html = cards
+    else:
+        emails_html = '<div class="empty"><div class="empty-icon">🔕</div>No notifications yet — emails appear here when a case status changes</div>'
+
+    # Log
+    log_lines = data["logs"]
+    log_html = ""
+    for line in log_lines:
+        cls = "ok" if "ok cases=" in line else ("err" if "failed" in line or "error" in line.lower() else "info")
+        ts = line[:20] if len(line) > 20 else ""
+        msg = line[21:] if len(line) > 21 else line
+        log_html += f'<div class="log-line"><span class="ts">{ts}</span> <span class="{cls}">{msg}</span></div>'
+    if not log_html:
+        log_html = '<div class="log-line">No log entries yet</div>'
+
+    # Last run
+    lr = data.get("last_run", "")
+    if lr:
+        try:
+            dt = datetime.fromisoformat(lr)
+            ago = (datetime.now(timezone.utc) - dt).total_seconds()
+            if ago < 60:
+                lr_text = f"{int(ago)}s ago"
+            elif ago < 3600:
+                lr_text = f"{int(ago/60)}m ago"
+            else:
+                lr_text = f"{int(ago/3600)}h ago"
+        except Exception:
+            lr_text = lr[:19]
+    else:
+        lr_text = "never"
+
+    scrape = data.get("last_scrape", "unknown")
+    scrape_map = {"success": "✅ last scrape OK", "failed": "❌ last scrape failed", "unknown": "⏳ pending"}
+    scrape_text = scrape_map.get(scrape, scrape)
+
+    html = DASHBOARD
+    replacements = {
+        "{ms_cls}": ms_cls, "{ms_text}": ms_text, "{ms_fix}": ms_fix,
+        "{pl_cls}": pl_cls, "{pl_text}": pl_text, "{pl_fix}": pl_fix,
+        "{cr_cls}": cr_cls, "{cr_text}": cr_text, "{cr_fix}": cr_fix,
+        "{ma_cls}": ma_cls, "{ma_text}": ma_text, "{ma_fix}": ma_fix,
+        "{case_count}": str(data["case_count"]),
+        "{email_count}": str(data["email_count"]),
+        "{last_run}": lr_text,
+        "{scrape_status}": scrape_text,
+        "{cases_html}": cases_html,
+        "{emails_html}": emails_html,
+        "{log_html}": log_html,
+        "{case_list_url}": data.get("case_list_url", ""),
+    }
+    for k, v in replacements.items():
+        html = html.replace(k, v)
+    return html
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        """Handle service start requests from dashboard."""
+        if self.path == "/api/start":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode() if length else ""
+            try:
+                req = json.loads(body)
+            except Exception:
+                req = {}
+            svc = req.get("service", "")
+            result = {"ok": False, "msg": "unknown service"}
+            if svc == "poller":
+                r = subprocess.run(["launchctl", "load", os.path.expanduser("~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist")], capture_output=True, text=True)
+                result = {"ok": r.returncode == 0, "msg": (r.stderr or r.stdout or "started").strip()}
+            elif svc == "chrome":
+                r = subprocess.run(["open", "-a", "Google Chrome"], capture_output=True, text=True)
+                result = {"ok": r.returncode == 0, "msg": "opened"}
+            elif svc == "mailapp":
+                r = subprocess.run(["open", "-a", "Mail"], capture_output=True, text=True)
+                result = {"ok": r.returncode == 0, "msg": "opened"}
+            elif svc == "mailserver":
+                result = {"ok": True, "msg": "already running"}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        if self.path == "/api/config":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode() if length else ""
+            try:
+                req = json.loads(body)
+            except Exception:
+                req = {}
+            new_url = req.get("case_list_url", "").strip()
+            if new_url and "lightning" in new_url:
+                cfg = _read_config()
+                cfg["case_list_url"] = new_url
+                _save_config(cfg)
+                # Restart poller with new URL
+                plist = os.path.expanduser("~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist")
+                subprocess.run(["launchctl", "unload", plist], capture_output=True)
+                import time; time.sleep(1)
+                # Clear state so it re-initialises with new view
+                state_f = os.path.expanduser("~/.local/state/sf-case-status.json")
+                if os.path.exists(state_f):
+                    os.remove(state_f)
+                subprocess.run(["launchctl", "load", plist], capture_output=True)
+                result = {"ok": True, "msg": "Saved & poller restarted"}
+            else:
+                result = {"ok": False, "msg": "Invalid URL"}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/api/status":
+            data = _get_status_data()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, default=str).encode())
+            return
+
+        if self.path == "/api/emails":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(EMAILS).encode())
+            return
+
+        data = _get_status_data()
+        html = _render(data)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def run_web(port=8090):
+    server = HTTPServer(("0.0.0.0", port), WebHandler)
+    print(f"[WEB]  http://localhost:{port}")
+    server.serve_forever()
+
+
+def main():
+    print("=" * 50)
+    print("  SF Notification Center")
+    print("  SMTP: localhost:2525")
+    print("  Web:  http://localhost:8090")
+    print("=" * 50)
+
+    controller = Controller(MailHandler(), hostname="0.0.0.0", port=2525)
+    controller.start()
+    print("[SMTP] Listening on port 2525")
+
+    run_web(8090)
+
+
+if __name__ == "__main__":
+    main()

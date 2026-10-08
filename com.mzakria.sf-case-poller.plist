@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mzakria.sf-case-poller</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/mzakria/.local/bin/sf-case-poller</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/mzakria/Library/Logs/sf-case-poller-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mzakria/Library/Logs/sf-case-poller-stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SF_POLL_INTERVAL</key>
+        <string>300</string>
+        <key>SF_NOTIFY_EMAIL</key>
+        <string>mzakria@redhat.com</string>
+    </dict>
+</dict>
+</plist>
