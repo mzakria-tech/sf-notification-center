@@ -645,12 +645,20 @@ def _ssh_python(script: str, timeout: int = 30) -> str:
             if os.path.exists(p):
                 ssh_key = p
                 break
+        # Find SSH_AUTH_SOCK dynamically (LaunchAgent may have stale path)
+        env = dict(os.environ)
+        sock = env.get("SSH_AUTH_SOCK", "")
+        if not sock or not os.path.exists(sock):
+            import glob
+            candidates = glob.glob("/private/tmp/com.apple.launchd.*/Listeners")
+            if candidates:
+                env["SSH_AUTH_SOCK"] = candidates[0]
         ssh_cmd = ["ssh", "-o", "ConnectTimeout=15", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"]
         if ssh_key:
             ssh_cmd += ["-i", ssh_key]
         ssh_cmd += [f"{SSH_USER}@{SUPPORTSHELL_HOST}", "python3"]
         r = subprocess.run(
-            ssh_cmd,
+            ssh_cmd, env=env,
             input=script, capture_output=True, text=True, timeout=timeout,
         )
         if r.returncode != 0:
