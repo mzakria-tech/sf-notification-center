@@ -93,6 +93,7 @@ def _init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS cases (
             case_id         TEXT PRIMARY KEY,
             case_number     TEXT,
+            external_number TEXT,
             status          TEXT,
             subject         TEXT,
             owner_alias     TEXT,
@@ -343,20 +344,63 @@ def _run_applescript(ascript: str, timeout: int = 45) -> str:
     return (r.stdout or "").strip()
 
 
-def chrome_js(js_code: str) -> str:
-    """Execute JS in Chrome's Salesforce tab — fully background, zero disruption.
+def chrome_js(js_code: str, need_all_rows: bool = False) -> str:
+    """Execute JS in Chrome's Salesforce tab.
 
-    Guarantees:
-      - Never activates Chrome or any window
-      - Never changes the active tab
-      - Never navigates / reloads
-      - Never opens a new tab or window
-      - Never steals focus
+    need_all_rows=False: pure background read — never activates anything.
+    need_all_rows=True:  if Chrome is NOT the frontmost app (user is in another app),
+                         briefly switch tabs to render virtual rows — completely invisible
+                         since Chrome is behind other windows. If Chrome IS frontmost,
+                         stays in background mode to avoid visual disruption.
     """
     b64 = base64.b64encode(js_code.encode("utf-8")).decode("ascii")
     exec_line = f'execute javascript "eval(atob(\'{b64}\'))"'
 
-    ascript = f'''
+    if need_all_rows:
+        # Proven approach: activate tab, navigate to list view, scroll, scrape, restore
+        ascript = f'''
+tell application "Google Chrome"
+    set sfTab to missing value
+    set sfWin to missing value
+    set sfTabIdx to 0
+    repeat with w in windows
+        repeat with i from 1 to count of tabs of w
+            set t to tab i of w
+            if URL of t contains "lightning" and URL of t contains "redhatsupport" then
+                set sfTab to t
+                set sfWin to w
+                set sfTabIdx to i
+                exit repeat
+            end if
+        end repeat
+        if sfTab is not missing value then exit repeat
+    end repeat
+    if sfTab is missing value then
+        tell window 1
+            set sfTab to make new tab with properties {{URL:"{CASE_LIST_URL}"}}
+            set sfWin to window 1
+            set sfTabIdx to (count of tabs of window 1)
+        end tell
+        delay 15
+    else
+        set curURL to URL of sfTab
+        if curURL does not contain "{CASE_LIST_URL}" then
+            set URL of sfTab to "{CASE_LIST_URL}"
+            delay 12
+        end if
+    end if
+    set origIdx to active tab index of sfWin
+    set active tab index of sfWin to sfTabIdx
+    delay 5
+    tell sfTab
+        set r to {exec_line}
+    end tell
+    set active tab index of sfWin to origIdx
+    return r
+end tell
+'''
+    else:
+        ascript = f'''
 tell application "Google Chrome"
     set sfTab to missing value
     repeat with w in windows
@@ -381,16 +425,65 @@ end tell
     return _run_applescript(ascript)
 
 
+
 def scrape_cases() -> tuple[list[dict], list[str]]:
     if not CASE_LIST_URL:
         raise RuntimeError("No case list URL configured — set it in the dashboard at http://localhost:8090")
-    cases, columns = _do_scrape()
+
+    # Try quiet first (no tab switch, no activation, zero disruption)
+    cases, columns = _do_scrape(need_all_rows=False)
+    if len(cases) >= 3:
+        log_info("scrape_mode", mode="background_quiet", activation="NO", cases=len(cases))
+        return cases, columns
+
+    # Fallback: activate tab only if quiet got too few rows
+    log_warn("scrape_quiet_insufficient", rows=len(cases))
+    cases, columns = _do_scrape(need_all_rows=True)
+    log_info("scrape_mode", mode="activated_fallback", cases=len(cases))
     return cases, columns
 
 
-def _do_scrape() -> tuple[list[dict], list[str]]:
-    # Zero-disruption JS: reads whatever rows are in the DOM right now.
-    # No scrolling. No waiting. No page interaction. Pure DOM read.
+def _do_scrape(need_all_rows: bool = False) -> tuple[list[dict], list[str]]:
+    # Build JS based on mode:
+    # need_all_rows=False: pure DOM read, no scrolling
+    # need_all_rows=True: scroll to force virtual rows to render (tab is active)
+    scroll_js = ""
+    if need_all_rows:
+        scroll_js = r"""
+        var scrollContainers = document.querySelectorAll('.uiScroller, .slds-scrollable_y, .slds-scrollable, [role="grid"], .listViewContent');
+        for (var si = 0; si < scrollContainers.length; si++) {
+            var sc = scrollContainers[si];
+            if (sc.scrollHeight > sc.clientHeight) {
+                for (var step = 0; step < 25; step++) {
+                    sc.scrollTop = step * 200;
+                    var tw = Date.now(); while (Date.now() - tw < 150) {}
+                }
+                sc.scrollTop = 0;
+                var tw2 = Date.now(); while (Date.now() - tw2 < 300) {}
+            }
+        }
+        for (var ps = 0; ps < 10; ps++) {
+            window.scrollTo(0, ps * 300);
+            var tw3 = Date.now(); while (Date.now() - tw3 < 150) {}
+        }
+        window.scrollTo(0, 0);
+        var tw10 = Date.now(); while (Date.now() - tw10 < 500) {}
+
+        // Wait for virtual rows to render (up to 10s)
+        var maxWait = 10000, waited = 0;
+        while (waited < maxWait) {
+            var checkRows = document.querySelectorAll('table tbody tr');
+            if (expected > 0 && checkRows.length >= expected) break;
+            if (checkRows.length >= 3 && waited > 3000) break;
+            if (waited % 2000 === 0 && waited > 0) {
+                window.scrollTo(0, document.body.scrollHeight);
+                var rs = Date.now(); while (Date.now() - rs < 200) {}
+                window.scrollTo(0, 0);
+            }
+            var t = Date.now(); while (Date.now() - t < 500) {}
+            waited += 500;
+        }
+        """
     js = r"""
     (function() {
         var expected = 0;
@@ -400,6 +493,7 @@ def _do_scrape() -> tuple[list[dict], list[str]]:
             var em = ht.match(/(\d+)\s+items?/i);
             if (em && ht.length < 150) { expected = parseInt(em[1]); break; }
         }
+        """ + scroll_js + r"""
         var rows = document.querySelectorAll('table tbody tr');
         if (rows.length === 0) rows = document.querySelectorAll('[data-row-key-value]');
         if (rows.length === 0) rows = document.querySelectorAll('table tr');
@@ -446,19 +540,28 @@ def _do_scrape() -> tuple[list[dict], list[str]]:
                 if (m) caseId = m[1];
             }
             if (!caseId) caseId = row.getAttribute('data-row-key-value') || '';
-            var caseNum = '';
+            // Extract BOTH external and internal case numbers
+            var extNum = '';
+            var intNum = '';
             for (var key in fields) {
-                if (/case.?number/i.test(key) || /internal.?case/i.test(key)) {
-                    var v = fields[key]; if (/^\d{5,10}$/.test(v)) { caseNum = v; break; }
+                var v = fields[key];
+                if (/^\d{5,10}$/.test(v)) {
+                    if (/^internal/i.test(key)) {
+                        intNum = v;
+                    } else if (/case.?number/i.test(key)) {
+                        extNum = v;
+                    }
                 }
             }
+            // Prefer external number (045xxxxx) for Hydra API compatibility
+            var caseNum = extNum || intNum || '';
             if (!caseNum) {
                 for (var key in fields) {
                     var vm = fields[key].match(/\b(\d{7,8})\b/);
                     if (vm) { caseNum = vm[1]; break; }
                 }
             }
-            if (caseNum || caseId) cases.push({ id: caseId, caseNum: caseNum, fields: fields });
+            if (caseNum || caseId) cases.push({ id: caseId, caseNum: caseNum, extNum: extNum, intNum: intNum, fields: fields });
         }
         var tableCount = document.querySelectorAll('table').length;
         var allTrCount = document.querySelectorAll('tr').length;
@@ -469,7 +572,7 @@ def _do_scrape() -> tuple[list[dict], list[str]]:
         });
     })()
     """
-    result = chrome_js(js)
+    result = chrome_js(js, need_all_rows=need_all_rows)
     if not result or result.startswith("ERROR:"):
         raise RuntimeError(f"Chrome JS returned: {result}")
     try:
@@ -490,14 +593,25 @@ def _do_scrape() -> tuple[list[dict], list[str]]:
     for row in data.get("cases", []):
         case_id = row.get("id", "")
         case_num = row.get("caseNum", "")
+        ext_num = row.get("extNum", "")
+        int_num = row.get("intNum", "")
         fields = row.get("fields", {})
         if not case_num and not case_id:
             continue
+        # Extract Last Modified Date for change detection (works for ALL cases)
+        last_mod = ""
+        for k, v in fields.items():
+            if "last modified" in k.lower() or "lastmodified" in k.lower():
+                last_mod = v.strip()
+                break
         cases.append({
             "Id": case_id, "CaseNumber": case_num,
+            "ExternalNumber": ext_num,
+            "InternalNumber": int_num,
             "Status": fields.get("Status", ""),
             "Subject": fields.get("Subject", ""),
             "OwnerAlias": fields.get("Case Owner Alias", ""),
+            "LastModified": last_mod,
             "fields": fields,
         })
     return cases, columns
@@ -530,10 +644,14 @@ def _ssh_python(script: str, timeout: int = 30) -> str:
 
 
 def fetch_comments_hydra(case_number: str) -> list[dict]:
+    """Fetch full comments for a single case via Red Hat GraphQL API."""
     script = f'''
-import json, urllib.request, urllib.parse
+import json, urllib.request, urllib.parse, os
 try:
-    with open("/home/remote/{SSH_USER}/.yank/oidc-tokens.json") as f:
+    gql_file = os.path.expanduser("~/.cache/hydra-mcp/tokens/redhat-sso-token.json")
+    if not os.path.exists(gql_file):
+        gql_file = "/home/remote/{SSH_USER}/.yank/oidc-tokens.json"
+    with open(gql_file) as f:
         d = json.load(f)
     data = urllib.parse.urlencode({{
         "grant_type": "refresh_token",
@@ -542,23 +660,64 @@ try:
     }}).encode()
     req = urllib.request.Request(
         "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token", data)
-    tokens = json.loads(urllib.request.urlopen(req, timeout=10).read())
-    at = tokens["access_token"]
-    req2 = urllib.request.Request(
-        "https://access.redhat.com/hydra/rest/cases/{case_number}/comments")
+    at = json.loads(urllib.request.urlopen(req, timeout=10).read())["access_token"]
+    gql = """query Q($cn: String!) {{
+  redhat_support_uiapi {{
+    query {{
+      RedHatSupportCase(where: {{ CaseNumber__c: {{ eq: $cn }} }}, first: 1) {{
+        edges {{
+          node {{
+            CaseComments__r(first: 200) {{
+              edges {{
+                node {{
+                  Body__c {{ value }}
+                  Visibility__c {{ value }}
+                  CreatedDate {{ value }}
+                  CreatedBy {{ Name {{ value }} }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"""
+    body = json.dumps({{"query": gql, "variables": {{"cn": "{case_number}"}}}}).encode()
+    req2 = urllib.request.Request("https://vpn.graphql.redhat.com", data=body)
     req2.add_header("Authorization", "Bearer " + at)
+    req2.add_header("Content-Type", "application/json")
     req2.add_header("Accept", "application/json")
-    resp = urllib.request.urlopen(req2, timeout=15)
-    comments = json.loads(resp.read())
+    req2.add_header("apollographql-client-name", "redhat-hydra-mcp-server")
+    req2.add_header("apollographql-client-version", "0.1.0")
+    resp = urllib.request.urlopen(req2, timeout=30)
+    rdata = json.loads(resp.read())
+    edges = (rdata.get("data", {{}}).get("redhat_support_uiapi", {{}})
+             .get("query", {{}}).get("RedHatSupportCase", {{}}).get("edges", []))
     result = []
-    for c in comments[-5:]:
-        author = c.get("createdByUser", "")
-        if isinstance(author, dict):
-            author = author.get("fullName", author.get("name", ""))
-        date = c.get("createdDate", "")
-        body = c.get("commentBody", c.get("text", ""))
-        public = c.get("isPublic", True)
-        result.append({{"author": author, "date": date, "body": str(body)[:500], "isPublic": public}})
+    if edges:
+        node = edges[0].get("node", {{}})
+        c_edges = (node.get("CaseComments__r", {{}}) or {{}}).get("edges", [])
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for e in c_edges:
+            n = e.get("node", {{}})
+            date = (n.get("CreatedDate", {{}}) or {{}}).get("value", "")
+            author = ((n.get("CreatedBy", {{}}) or {{}}).get("Name", {{}}) or {{}}).get("value", "")
+            cbody = (n.get("Body__c", {{}}) or {{}}).get("value", "")
+            vis = (n.get("Visibility__c", {{}}) or {{}}).get("value", "")
+            public = vis != "Private" if vis else True
+            if date >= cutoff:
+                result.append({{"author": author, "date": date, "body": str(cbody)[:500], "isPublic": public, "recent": True}})
+        if not result:
+            for e in c_edges[-3:]:
+                n = e.get("node", {{}})
+                date = (n.get("CreatedDate", {{}}) or {{}}).get("value", "")
+                author = ((n.get("CreatedBy", {{}}) or {{}}).get("Name", {{}}) or {{}}).get("value", "")
+                cbody = (n.get("Body__c", {{}}) or {{}}).get("value", "")
+                vis = (n.get("Visibility__c", {{}}) or {{}}).get("value", "")
+                public = vis != "Private" if vis else True
+                result.append({{"author": author, "date": date, "body": str(cbody)[:500], "isPublic": public, "recent": False}})
     print(json.dumps(result))
 except Exception as e:
     print(json.dumps({{"error": str(e)}}))
@@ -577,15 +736,16 @@ except Exception as e:
 
 
 def fetch_batch_comment_info(case_numbers: list[str]) -> dict[str, dict]:
-    """One SSH call to get latest comment metadata for all cases."""
+    """One SSH call to get latest comment metadata for ALL cases via Red Hat GraphQL API."""
     if not case_numbers:
         return {}
     cases_json = json.dumps(case_numbers)
     script = f'''
-import json, urllib.request, urllib.parse
+import json, urllib.request, urllib.parse, os
+
 cases = {cases_json}
-try:
-    with open("/home/remote/{SSH_USER}/.yank/oidc-tokens.json") as f:
+def get_token(token_file):
+    with open(token_file) as f:
         d = json.load(f)
     data = urllib.parse.urlencode({{
         "grant_type": "refresh_token",
@@ -594,27 +754,64 @@ try:
     }}).encode()
     req = urllib.request.Request(
         "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token", data)
-    tokens = json.loads(urllib.request.urlopen(req, timeout=10).read())
-    at = tokens["access_token"]
+    return json.loads(urllib.request.urlopen(req, timeout=10).read())["access_token"]
+
+try:
+    gql_file = os.path.expanduser("~/.cache/hydra-mcp/tokens/redhat-sso-token.json")
+    if not os.path.exists(gql_file):
+        gql_file = "/home/remote/{SSH_USER}/.yank/oidc-tokens.json"
+    at = get_token(gql_file)
+
+    gql_query = """query Q($cn: String!) {{
+  redhat_support_uiapi {{
+    query {{
+      RedHatSupportCase(where: {{ CaseNumber__c: {{ eq: $cn }} }}, first: 1) {{
+        edges {{
+          node {{
+            CaseComments__r(first: 200) {{
+              edges {{
+                node {{
+                  CreatedDate {{ value }}
+                  CreatedBy {{ Name {{ value }} }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"""
     result = {{}}
     for cn in cases:
         try:
-            req2 = urllib.request.Request(
-                "https://access.redhat.com/hydra/rest/cases/" + cn + "/comments")
+            body = json.dumps({{"query": gql_query, "variables": {{"cn": cn}}}}).encode()
+            req2 = urllib.request.Request("https://vpn.graphql.redhat.com", data=body)
             req2.add_header("Authorization", "Bearer " + at)
+            req2.add_header("Content-Type", "application/json")
             req2.add_header("Accept", "application/json")
-            resp = urllib.request.urlopen(req2, timeout=10)
-            comments = json.loads(resp.read())
-            if comments:
-                last = comments[-1]
-                author = last.get("createdByUser", "")
-                if isinstance(author, dict):
-                    author = author.get("fullName", author.get("name", ""))
-                result[cn] = {{"count": len(comments), "latestDate": last.get("createdDate", ""), "latestAuthor": author}}
+            req2.add_header("apollographql-client-name", "redhat-hydra-mcp-server")
+            req2.add_header("apollographql-client-version", "0.1.0")
+            resp = urllib.request.urlopen(req2, timeout=15)
+            data = json.loads(resp.read())
+            edges = (data.get("data", {{}}).get("redhat_support_uiapi", {{}})
+                     .get("query", {{}}).get("RedHatSupportCase", {{}}).get("edges", []))
+            if edges:
+                node = edges[0].get("node", {{}})
+                c_edges = (node.get("CaseComments__r", {{}}) or {{}}).get("edges", [])
+                count = len(c_edges)
+                if c_edges:
+                    last = c_edges[-1].get("node", {{}})
+                    date = (last.get("CreatedDate", {{}}) or {{}}).get("value", "")
+                    author = ((last.get("CreatedBy", {{}}) or {{}}).get("Name", {{}}) or {{}}).get("value", "")
+                    result[cn] = {{"count": count, "latestDate": date, "latestAuthor": author}}
+                else:
+                    result[cn] = {{"count": 0, "latestDate": "", "latestAuthor": ""}}
             else:
                 result[cn] = {{"count": 0, "latestDate": "", "latestAuthor": ""}}
-        except Exception:
-            result[cn] = {{"count": 0, "latestDate": "", "latestAuthor": ""}}
+        except Exception as ex:
+            result[cn] = {{"count": 0, "latestDate": "", "latestAuthor": "", "error": str(ex)[:80]}}
+
     print(json.dumps(result))
 except Exception as e:
     print(json.dumps({{"error": str(e)}}))
@@ -632,6 +829,18 @@ except Exception as e:
         return {}
 
 
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and decode entities from comment body."""
+    import re, html
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    # Collapse multiple blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def _format_comments(comments: list[dict]) -> str:
     if not comments:
         return ""
@@ -640,11 +849,101 @@ def _format_comments(comments: list[dict]) -> str:
         author = c.get("author", "").strip() or "Unknown"
         date = (c.get("date") or "")[:19].replace("T", " ")
         visibility = "Public" if c.get("isPublic", True) else "Private"
-        body = (c.get("body") or "").strip()
+        body = _strip_html((c.get("body") or "").strip())
         if body:
             lines.append(f"\n[{visibility}] {author} ({date}):")
             lines.append(body[:400])
     return "\n".join(lines)
+
+
+# ─── Hydra-only Comment Check (no Chrome, runs every 1 min) ───────────────
+def _comment_only_check(conn: sqlite3.Connection):
+    """Quick Hydra-only check for new comments — zero Chrome interaction."""
+    if ssh_circuit.is_open:
+        return
+    rows = conn.execute(
+        "SELECT case_id, case_number, external_number, owner_alias, last_comment_date, comment_count, subject, status "
+        "FROM cases WHERE case_number != ''"
+    ).fetchall()
+    owned = []
+    for r in rows:
+        if r["owner_alias"] and SSH_USER and r["owner_alias"].lower() != SSH_USER.lower():
+            continue
+        cn = r["case_number"]
+        owned.append((r["case_id"], cn, cn))
+    if not owned:
+        return
+    api_nums = [a for _, _, a in owned]
+    log_info("comment_check_start", mode="graphql", cases=len(api_nums))
+    info = fetch_batch_comment_info(api_nums)
+    if not info:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    events = 0
+    for cid, num, ext in owned:
+        if ext not in info:
+            continue
+        ci = info[ext]
+        new_date = ci.get("latestDate", "")
+        new_count = ci.get("count", 0)
+
+        row = conn.execute(
+            "SELECT last_comment_date, comment_count FROM cases WHERE case_id=?", (cid,)
+        ).fetchone()
+        old_date = row["last_comment_date"] if row else ""
+        old_count = row["comment_count"] if row else 0
+
+        conn.execute(
+            "UPDATE cases SET last_comment_date=?, comment_count=? WHERE case_id=?",
+            (new_date, new_count, cid),
+        )
+
+        if old_date and new_date and new_date > old_date:
+            new_comments_count = new_count - old_count if new_count > old_count else 1
+            author = ci.get("latestAuthor", "Someone")
+            ehash = _event_hash(cid, "COMMENT", old_date, new_date)
+            existing = conn.execute("SELECT event_id FROM events WHERE event_hash=?", (ehash,)).fetchone()
+            if existing:
+                continue
+
+            log_info("new_comment_detected", case=num, ext=ext, by=author, new_comments=new_comments_count)
+            fetched = fetch_comments_hydra(ext)
+            comment_text = _format_comments(fetched)
+
+            case_row = conn.execute("SELECT subject, status FROM cases WHERE case_id=?", (cid,)).fetchone()
+            subject = case_row["subject"] if case_row else ""
+            cur_status = case_row["status"] if case_row else ""
+            link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
+
+            conn.execute(
+                "INSERT INTO events (case_id, case_number, event_type, old_value, new_value, event_time, event_hash, details) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (cid, num, "COMMENT", old_date, new_date, now, ehash,
+                 f"{new_comments_count} new comment(s) by {author}"),
+            )
+            event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            title = f"New comment on Case {num}" + (f" ({new_comments_count} new)" if new_comments_count > 1 else "")
+            body = (
+                f"{'New comment' if new_comments_count == 1 else f'{new_comments_count} new comments'} on case {num}.\n"
+                f"By: {author}\nStatus: {cur_status}\n"
+                f"Subject: {subject}\n{link}\n{comment_text}\n"
+            )
+            queue_notification(conn, event_id, title, body)
+            events += 1
+
+    conn.commit()
+
+    # Dispatch pending notifications
+    if events > 0:
+        pending = conn.execute(
+            "SELECT notif_id FROM notifications WHERE status IN ('PENDING', 'RETRY')"
+        ).fetchall()
+        for row in pending:
+            dispatch_notification(conn, row["notif_id"])
+
+    log_info("comment_check_complete", mode="hydra_only", events=events)
 
 
 # ─── Core Poll Logic ───────────────────────────────────────────────────────
@@ -709,22 +1008,26 @@ def poll_once(conn: sqlite3.Connection) -> dict:
         if not cid:
             continue
         num = rec.get("CaseNumber", "")
+        ext_num = rec.get("ExternalNumber", "") or num
         status = rec.get("Status", "")
         subject = rec.get("Subject", "")
         owner = rec.get("OwnerAlias", "")
+        last_mod = rec.get("LastModified", "")
         fields = rec.get("fields", {})
 
         old = conn.execute("SELECT * FROM cases WHERE case_id=?", (cid,)).fetchone()
         old_status = old["status"] if old else None
+        old_last_mod = old["last_modified"] if old else ""
 
-        # Upsert case
+        # Upsert case (store external number for Hydra API compatibility)
         conn.execute("""
-            INSERT INTO cases (case_id, case_number, status, subject, owner_alias, fields_json, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cases (case_id, case_number, external_number, status, subject, owner_alias, last_modified, fields_json, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(case_id) DO UPDATE SET
+                case_number=excluded.case_number, external_number=excluded.external_number,
                 status=excluded.status, subject=excluded.subject, owner_alias=excluded.owner_alias,
-                fields_json=excluded.fields_json, last_seen=excluded.last_seen
-        """, (cid, num, status, subject, owner, json.dumps(fields), now, now))
+                last_modified=excluded.last_modified, fields_json=excluded.fields_json, last_seen=excluded.last_seen
+        """, (cid, num, ext_num, status, subject, owner, last_mod, json.dumps(fields), now, now))
 
         if not initialized:
             continue
@@ -744,11 +1047,11 @@ def poll_once(conn: sqlite3.Connection) -> dict:
             status_changed_cases.add(num)
             log_info("status_change_detected", case=num, old=old_status, new=status)
 
-            # Fetch comments
+            # Fetch comments using external case number for Hydra
             comments = []
-            if num:
-                comments = fetch_comments_hydra(num)
-                log_info("comments_fetched", case=num, count=len(comments))
+            if ext_num:
+                comments = fetch_comments_hydra(ext_num)
+                log_info("comments_fetched", case=num, ext=ext_num, count=len(comments))
             comment_text = _format_comments(comments)
 
             # Create event
@@ -772,6 +1075,7 @@ def poll_once(conn: sqlite3.Connection) -> dict:
     conn.commit()
 
     # 4. Batch comment check (one SSH call for all owned cases)
+    #    Uses Red Hat GraphQL API for ALL cases
     if initialized and not ssh_circuit.is_open:
         owned = []
         for rec in cases:
@@ -781,17 +1085,17 @@ def poll_once(conn: sqlite3.Connection) -> dict:
                 continue
             num = rec.get("CaseNumber", "")
             if num and num not in status_changed_cases:
-                owned.append((cid, num))
+                owned.append((cid, num, num))
 
         if owned:
             log_info("batch_comment_check", count=len(owned))
-            nums = [n for _, n in owned]
-            info = fetch_batch_comment_info(nums)
+            ext_nums = [e for _, _, e in owned]
+            info = fetch_batch_comment_info(ext_nums)
 
-            for cid, num in owned:
-                if num not in info:
+            for cid, num, ext in owned:
+                if ext not in info:
                     continue
-                ci = info[num]
+                ci = info[ext]
                 new_date = ci.get("latestDate", "")
                 new_count = ci.get("count", 0)
 
@@ -815,9 +1119,9 @@ def poll_once(conn: sqlite3.Connection) -> dict:
                     if existing:
                         continue
 
-                    log_info("new_comment_detected", case=num, by=author, new_comments=new_comments_count)
+                    log_info("new_comment_detected", case=num, ext=ext, by=author, new_comments=new_comments_count)
 
-                    fetched = fetch_comments_hydra(num)
+                    fetched = fetch_comments_hydra(ext)
                     comment_text = _format_comments(fetched)
 
                     case_row = conn.execute("SELECT subject, status FROM cases WHERE case_id=?", (cid,)).fetchone()
@@ -841,6 +1145,69 @@ def poll_once(conn: sqlite3.Connection) -> dict:
                     )
                     queue_notification(conn, event_id, title, body)
                     stats["events"] += 1
+
+    # 4b. For 077 cases (no Hydra), detect changes via "Last Modified Date" from list view
+    #     If Last Modified changed but status didn't change, it's likely a new comment or update
+    if initialized:
+        for rec in cases:
+            cid = rec.get("Id") or rec.get("CaseNumber") or ""
+            if not cid:
+                continue
+            num = rec.get("CaseNumber", "")
+            ext = rec.get("ExternalNumber", "") or num
+            last_mod = rec.get("LastModified", "")
+            status = rec.get("Status", "")
+            owner = rec.get("OwnerAlias", "")
+
+            # Only process 077 cases (045 cases already handled by Hydra above)
+            if not ext.startswith("077"):
+                continue
+            # Owner filter
+            if owner and SSH_USER and owner.lower() != SSH_USER.lower():
+                continue
+            # Skip if no Last Modified data (column not added to list view yet)
+            if not last_mod:
+                continue
+            # Skip if status already changed (already notified above)
+            if num in status_changed_cases:
+                continue
+
+            old = conn.execute("SELECT last_modified, status FROM cases WHERE case_id=?", (cid,)).fetchone()
+            if not old or not old["last_modified"]:
+                continue
+            old_mod = old["last_modified"]
+            old_st = old["status"]
+
+            # If Last Modified changed but status didn't → likely a comment or field update
+            if last_mod != old_mod and status.strip().lower() == old_st.strip().lower():
+                ehash = _event_hash(cid, "MODIFIED", old_mod, last_mod)
+                existing = conn.execute("SELECT event_id FROM events WHERE event_hash=?", (ehash,)).fetchone()
+                if existing:
+                    continue
+
+                log_info("case_modified_detected", case=num, old_mod=old_mod, new_mod=last_mod)
+
+                subject_text = rec.get("Subject", "")
+                link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
+
+                conn.execute(
+                    "INSERT INTO events (case_id, case_number, event_type, old_value, new_value, event_time, event_hash, details) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (cid, num, "MODIFIED", old_mod, last_mod, now, ehash,
+                     "Case modified (likely new comment or update)"),
+                )
+                event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                title = f"Case {num} Updated"
+                body = (
+                    f"Case {num} was modified.\n"
+                    f"Status: {status}\n"
+                    f"Subject: {subject_text}\n"
+                    f"Modified: {old_mod} -> {last_mod}\n"
+                    f"{link}\n"
+                )
+                queue_notification(conn, event_id, title, body)
+                stats["events"] += 1
 
     conn.commit()
 
@@ -1104,13 +1471,24 @@ def main() -> int:
     except Exception:
         pass
 
+    COMMENT_INTERVAL = 60   # Hydra comment check every 1 min (no Chrome)
+    SCRAPE_INTERVAL = 300   # Full Chrome scrape every 5 min
+    last_scrape = 0
+
     while True:
+        now_ts = time.time()
         try:
-            poll_once(conn)
+            if now_ts - last_scrape >= SCRAPE_INTERVAL:
+                # Full poll: Chrome scrape + status detection + comment check
+                poll_once(conn)
+                last_scrape = now_ts
+            else:
+                # Quick poll: Hydra-only comment check (no Chrome, zero disruption)
+                _comment_only_check(conn)
             process_retry_queue(conn)
         except Exception as exc:
             log_error("poll_error", error=str(exc)[:200])
-        time.sleep(INTERVAL)
+        time.sleep(COMMENT_INTERVAL)
 
 
 if __name__ == "__main__":
