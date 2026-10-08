@@ -72,6 +72,16 @@ def _check_service(name: str) -> dict:
     elif name == "mailapp":
         r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
         return {"running": r.returncode == 0, "label": "Mail.app"}
+    elif name == "vpn":
+        try:
+            r = subprocess.run(["scutil", "--nc", "list"], capture_output=True, text=True, timeout=3)
+            connected = "Connected" in (r.stdout or "")
+            if not connected:
+                r2 = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3)
+                connected = "utun" in (r2.stdout or "")
+            return {"running": connected, "label": "VPN"}
+        except Exception:
+            return {"running": False, "label": "VPN"}
     return {"running": False, "label": name}
 
 
@@ -117,6 +127,7 @@ def _get_status_data() -> dict:
     poller = _check_service("poller")
     chrome = _check_service("chrome")
     mailapp = _check_service("mailapp")
+    vpn = _check_service("vpn")
     state = _read_state()
     cases, columns = _read_cases()
     logs = _last_log_lines(8)
@@ -140,6 +151,7 @@ def _get_status_data() -> dict:
         "poller": poller,
         "chrome": chrome,
         "mailapp": mailapp,
+        "vpn": vpn,
         "mailserver": {"running": True, "label": "Mail Server"},
         "cases": cases,
         "columns": columns,
@@ -175,7 +187,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .subtitle{color:#94a3b8;font-size:13px;margin-bottom:22px}
 
 /* Service grid */
-.svc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+.svc-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:22px}
 .svc{background:#1e293b;border-radius:10px;padding:14px;text-align:center;position:relative;overflow:hidden;border:1px solid #334155;transition:transform 0.2s,box-shadow 0.2s}
 .svc:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,0.3)}
 .svc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
@@ -311,6 +323,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <div class="svc-label">Mail.app</div>
     <div class="svc-status {ma_cls}"><div class="dot {ma_cls}"></div>{ma_text}</div>
     {ma_fix}
+  </div>
+  <div class="svc" style="background:linear-gradient(135deg,#1e3a5f,#0f2942);border:1px solid #1e4976">
+    <div class="svc-icon">🔒</div>
+    <div class="svc-label">VPN</div>
+    <div class="svc-status {vpn_cls}"><div class="dot {vpn_cls}"></div>{vpn_text}</div>
+    {vpn_fix}
   </div>
 </div>
 
@@ -451,6 +469,7 @@ def _render(data: dict) -> str:
     pl_cls, pl_text = svc(data["poller"])
     cr_cls, cr_text = svc(data["chrome"])
     ma_cls, ma_text = svc(data["mailapp"])
+    vpn_cls, vpn_text = svc(data["vpn"])
 
     # Start buttons for stopped services
     def start_btn(svc_id, label="▶ Start"):
@@ -460,6 +479,7 @@ def _render(data: dict) -> str:
     pl_fix = "" if data["poller"]["running"] else start_btn("poller", "▶ Start Poller")
     cr_fix = "" if data["chrome"]["running"] else start_btn("ssh", "🔧 Test SSH")
     ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
+    vpn_fix = "" if data["vpn"]["running"] else '<div class="svc-fix" style="font-size:11px">Connect Red Hat VPN</div>'
 
     # Cases table — dynamically match Salesforce columns
     cases = data["cases"]
@@ -570,6 +590,7 @@ def _render(data: dict) -> str:
         "{pl_cls}": pl_cls, "{pl_text}": pl_text, "{pl_fix}": pl_fix,
         "{cr_cls}": cr_cls, "{cr_text}": cr_text, "{cr_fix}": cr_fix,
         "{ma_cls}": ma_cls, "{ma_text}": ma_text, "{ma_fix}": ma_fix,
+        "{vpn_cls}": vpn_cls, "{vpn_text}": vpn_text, "{vpn_fix}": vpn_fix,
         "{case_count}": str(data["case_count"]),
         "{email_count}": str(data["email_count"]),
         "{last_run}": lr_text,
