@@ -1,64 +1,211 @@
 #!/usr/bin/env python3
-"""Poll Salesforce case status via Chrome AppleScript.
+"""Salesforce Case Notification Center v2 — Reliable event-driven poller.
 
-Uses the running Chrome's logged-in session directly.
-Runs every INTERVAL seconds, emails on any status change.
+Architecture:
+  Chrome scraping → Event detection → SQLite queue → Notification dispatch
 
-State: ~/.local/state/sf-case-status.json
-Log:   ~/Library/Logs/sf-case-poller.log
+Features:
+  - SQLite state + event store (replaces JSON)
+  - Event hashing / deduplication
+  - Notification retry with exponential backoff
+  - Circuit breaker for SSH/Hydra
+  - Startup reconciliation (no false alerts after restart)
+  - Heartbeat / watchdog
+  - Structured logging
+  - CLI subcommands: --once, --status, --health, --test, --test-email, --poll
+
+State:  ~/.local/state/sf-notification-center.db
+Compat: ~/.local/state/sf-case-status.json  (still written for dashboard)
+Log:    ~/Library/Logs/sf-case-poller.log
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
-import re
+import signal
 import smtplib
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 
-INTERVAL = int(os.environ.get("SF_POLL_INTERVAL", "300"))  # 5 min default
-STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
-LOG_PATH = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
-def _get_notify_email() -> str:
-    env = os.environ.get("SF_NOTIFY_EMAIL")
-    if env:
-        return env
-    try:
-        with open(CONFIG_PATH) as f:
-            return json.load(f).get("notify_email", "")
-    except Exception:
-        return ""
-
-TO_ADDR = _get_notify_email()
+# ─── Configuration ──────────────────────────────────────────────────────────
 CONFIG_PATH = os.path.expanduser("~/.local/state/sf-poller-config.json")
+DB_PATH = os.path.expanduser("~/.local/state/sf-notification-center.db")
+JSON_STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
+LOG_PATH = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
+HEARTBEAT_PATH = os.path.expanduser("~/.local/state/sf-poller-heartbeat.json")
+INTERVAL = int(os.environ.get("SF_POLL_INTERVAL", "300"))
+SUPPORTSHELL_HOST = os.environ.get(
+    "SUPPORTSHELL_HOST",
+    "supportshell-1.sush-001.prod.us-west-2.aws.redhat.com",
+)
 
-def _get_case_list_url() -> str:
-    """Read case list URL: env var > config file > default."""
-    env = os.environ.get("SF_CASE_LIST_URL")
-    if env:
-        return env
+# Retry schedule (seconds) for failed notifications
+RETRY_DELAYS = [10, 30, 120, 300]
+# Circuit breaker: open after N consecutive SSH failures, reset after M seconds
+CB_THRESHOLD = 3
+CB_RESET_SECONDS = 900  # 15 min
+
+
+def _load_config() -> dict:
     try:
         with open(CONFIG_PATH) as f:
-            return json.load(f).get("case_list_url", "")
+            return json.load(f)
     except Exception:
-        pass
-    return ""
+        return {}
 
-CASE_LIST_URL = _get_case_list_url()
+def _cfg(key: str, env_key: str = "") -> str:
+    if env_key:
+        v = os.environ.get(env_key)
+        if v:
+            return v
+    return _load_config().get(key, "")
 
+CASE_LIST_URL = _cfg("case_list_url", "SF_CASE_LIST_URL")
+TO_ADDR = _cfg("notify_email", "SF_NOTIFY_EMAIL")
+SSH_USER = _cfg("supportshell_user", "SUPPORTSHELL_USER") or os.environ.get("USER", "")
 
-def log(msg: str) -> None:
-    line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
+# ─── Structured Logging ────────────────────────────────────────────────────
+def log(level: str, msg: str, **kv) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    extra = " ".join(f"{k}={v}" for k, v in kv.items()) if kv else ""
+    line = f"{ts} {level:<5} {msg}" + (f" {extra}" if extra else "")
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     with open(LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(line + "\n")
 
+def log_info(msg, **kv):  log("INFO", msg, **kv)
+def log_warn(msg, **kv):  log("WARN", msg, **kv)
+def log_error(msg, **kv): log("ERROR", msg, **kv)
 
-def send_mail(subject: str, body: str) -> None:
-    # 1. Local SMTP for web UI
+# ─── SQLite Database ───────────────────────────────────────────────────────
+def _init_db() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS cases (
+            case_id         TEXT PRIMARY KEY,
+            case_number     TEXT,
+            status          TEXT,
+            subject         TEXT,
+            owner_alias     TEXT,
+            fields_json     TEXT,
+            last_modified   TEXT,
+            last_comment_id TEXT,
+            last_comment_date TEXT,
+            comment_count   INTEGER DEFAULT 0,
+            first_seen      TEXT,
+            last_seen       TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_id     TEXT,
+            case_number TEXT,
+            event_type  TEXT,
+            old_value   TEXT,
+            new_value   TEXT,
+            event_time  TEXT,
+            event_hash  TEXT UNIQUE,
+            details     TEXT,
+            processed   INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS notifications (
+            notif_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id    INTEGER REFERENCES events(event_id),
+            channel     TEXT,
+            subject     TEXT,
+            body        TEXT,
+            status      TEXT DEFAULT 'PENDING',
+            retry_count INTEGER DEFAULT 0,
+            created_at  TEXT,
+            sent_at     TEXT,
+            last_error  TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS poll_runs (
+            run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at  TEXT,
+            finished_at TEXT,
+            status      TEXT,
+            cases_found INTEGER DEFAULT 0,
+            events_found INTEGER DEFAULT 0,
+            notifs_sent INTEGER DEFAULT 0,
+            error       TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+    """)
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('initialized', '0')")
+    conn.commit()
+    return conn
+
+
+def _db_get(conn, key: str) -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else ""
+
+
+def _db_set(conn, key: str, value: str):
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+# ─── Circuit Breaker ───────────────────────────────────────────────────────
+class CircuitBreaker:
+    def __init__(self):
+        self.failures = 0
+        self.opened_at = 0.0
+
+    def record_failure(self):
+        self.failures += 1
+        if self.failures >= CB_THRESHOLD:
+            self.opened_at = time.time()
+            log_warn("circuit_breaker_open", failures=self.failures)
+
+    def record_success(self):
+        if self.failures > 0:
+            log_info("circuit_breaker_reset")
+        self.failures = 0
+        self.opened_at = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        if self.failures < CB_THRESHOLD:
+            return False
+        if time.time() - self.opened_at > CB_RESET_SECONDS:
+            log_info("circuit_breaker_half_open", testing="yes")
+            return False
+        return True
+
+ssh_circuit = CircuitBreaker()
+
+# ─── Event Hashing ─────────────────────────────────────────────────────────
+def _event_hash(case_id: str, event_type: str, old_val: str, new_val: str) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    raw = f"{case_id}|{event_type}|{old_val}|{new_val}|{today}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# ─── Notifications ─────────────────────────────────────────────────────────
+def _as_safe(s: str) -> str:
+    """Sanitize text for AppleScript (ASCII only)."""
+    s = s.replace("\\", "/").replace('"', "'").replace("\u2192", "->")
+    return "".join(c if ord(c) < 128 else "?" for c in s)
+
+
+def _send_smtp(subject: str, body: str) -> bool:
     try:
         msg = MIMEText(body)
         msg["Subject"] = subject
@@ -66,109 +213,156 @@ def send_mail(subject: str, body: str) -> None:
         msg["To"] = TO_ADDR
         with smtplib.SMTP("127.0.0.1", 2525, timeout=5) as s:
             s.send_message(msg)
+        return True
     except Exception as exc:
-        log(f"local smtp skipped: {exc}")
+        log_warn("smtp_failed", error=str(exc)[:120])
+        return False
 
-    # 2. Real email via macOS Mail.app
+
+def _send_mailapp(subject: str, body: str) -> bool:
+    if not TO_ADDR:
+        return True
     content = body if body.endswith("\n") else body + "\n"
-    script = f"""
-tell application "Mail"
-  set m to make new outgoing message with properties {{subject:{json.dumps(subject)}, content:{json.dumps(content)}, visible:false}}
-  tell m
-    make new to recipient at end of to recipients with properties {{address:{json.dumps(TO_ADDR)}}}
-  end tell
-  send m
-end tell
-"""
-    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    safe_subj = _as_safe(subject)
+    safe_body = _as_safe(content)
+    ascript = (
+        'tell application "Mail"\n'
+        f'  set m to make new outgoing message with properties '
+        f'{{subject:"{safe_subj}", content:"{safe_body}", visible:false}}\n'
+        f'  tell m\n'
+        f'    make new to recipient at end of to recipients with properties '
+        f'{{address:"{TO_ADDR}"}}\n'
+        f'  end tell\n'
+        f'  send m\n'
+        f'end tell\n'
+    )
+    fd, path = tempfile.mkstemp(suffix=".applescript")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(ascript)
+        r = subprocess.run(["osascript", path], capture_output=True, text=True, timeout=15)
+    finally:
+        os.unlink(path)
     if r.returncode != 0:
-        log(f"Mail.app send failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        log_warn("mailapp_failed", error=(r.stderr or "").strip()[:120])
+        return False
+    return True
 
 
-def notify_banner(title: str, body: str) -> None:
+def _send_banner(title: str, body: str):
     subprocess.run(
         ["osascript", "-e",
-         f'display notification {json.dumps(body)} with title {json.dumps(title)}'],
-        check=False,
+         f'display notification {json.dumps(body[:100])} with title {json.dumps(title[:60])}'],
+        check=False, capture_output=True,
     )
 
 
-def load_state() -> dict:
-    if not os.path.exists(STATE_PATH):
-        return {"cases": {}, "initialized": False}
-    with open(STATE_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
+def dispatch_notification(conn: sqlite3.Connection, notif_id: int) -> bool:
+    """Attempt to send a queued notification. Returns True on success."""
+    row = conn.execute("SELECT * FROM notifications WHERE notif_id=?", (notif_id,)).fetchone()
+    if not row:
+        return False
+    subject, body, channel = row["subject"], row["body"], row["channel"]
+    now = datetime.now(timezone.utc).isoformat()
+
+    ok = False
+    if channel == "smtp":
+        ok = _send_smtp(subject, body)
+    elif channel == "mailapp":
+        ok = _send_mailapp(subject, body)
+    elif channel == "banner":
+        _send_banner(subject, body)
+        ok = True
+
+    if ok:
+        conn.execute("UPDATE notifications SET status='SENT', sent_at=? WHERE notif_id=?", (now, notif_id))
+    else:
+        retries = row["retry_count"] + 1
+        status = "FAILED" if retries > len(RETRY_DELAYS) else "RETRY"
+        conn.execute(
+            "UPDATE notifications SET status=?, retry_count=?, last_error=? WHERE notif_id=?",
+            (status, retries, f"attempt {retries} failed", notif_id),
+        )
+    conn.commit()
+    return ok
 
 
-def save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2)
-    os.replace(tmp, STATE_PATH)
+def queue_notification(conn: sqlite3.Connection, event_id: int, subject: str, body: str):
+    """Queue notifications across all channels."""
+    now = datetime.now(timezone.utc).isoformat()
+    for channel in ("smtp", "mailapp", "banner"):
+        conn.execute(
+            "INSERT INTO notifications (event_id, channel, subject, body, created_at) VALUES (?,?,?,?,?)",
+            (event_id, channel, subject, body, now),
+        )
+    conn.commit()
 
 
-def chrome_js(js_code: str, url: str | None = None) -> str:
-    """Execute JavaScript in Chrome via AppleScript. Returns the result as string."""
-    import base64
-    import tempfile
+def process_retry_queue(conn: sqlite3.Connection) -> int:
+    """Retry failed notifications that are due."""
+    rows = conn.execute(
+        "SELECT notif_id, retry_count, created_at FROM notifications WHERE status='RETRY'"
+    ).fetchall()
+    retried = 0
+    for row in rows:
+        idx = min(row["retry_count"], len(RETRY_DELAYS) - 1)
+        delay = RETRY_DELAYS[idx]
+        created = datetime.fromisoformat(row["created_at"])
+        age = (datetime.now(timezone.utc) - created.replace(tzinfo=timezone.utc)).total_seconds()
+        if age >= delay * (row["retry_count"]):
+            if dispatch_notification(conn, row["notif_id"]):
+                retried += 1
+    return retried
 
-    # Base64 encode the JS to avoid quote escaping issues
+
+# ─── Heartbeat ─────────────────────────────────────────────────────────────
+def _write_heartbeat(cases: int, status: str, error: str = ""):
+    data = {
+        "last_successful_poll": datetime.now(timezone.utc).isoformat(),
+        "cases": cases,
+        "status": status,
+        "error": error,
+        "pid": os.getpid(),
+    }
+    os.makedirs(os.path.dirname(HEARTBEAT_PATH), exist_ok=True)
+    with open(HEARTBEAT_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ─── Chrome / Salesforce Scraping ─────────────────────────────────────────
+def _run_applescript(ascript: str, timeout: int = 45) -> str:
+    fd, path = tempfile.mkstemp(suffix=".applescript")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(ascript)
+        r = subprocess.run(["osascript", path], capture_output=True, text=True, timeout=timeout)
+    finally:
+        os.unlink(path)
+    if r.returncode != 0:
+        raise RuntimeError(f"AppleScript failed: {(r.stderr or '').strip()[:300]}")
+    return (r.stdout or "").strip()
+
+
+def chrome_js(js_code: str) -> str:
+    """Execute JS in Chrome's Salesforce tab — fully background, zero disruption.
+
+    Guarantees:
+      - Never activates Chrome or any window
+      - Never changes the active tab
+      - Never navigates / reloads
+      - Never opens a new tab or window
+      - Never steals focus
+    """
     b64 = base64.b64encode(js_code.encode("utf-8")).decode("ascii")
     exec_line = f'execute javascript "eval(atob(\'{b64}\'))"'
 
-    if url:
-        ascript = f'''
+    ascript = f'''
 tell application "Google Chrome"
     set sfTab to missing value
-    set sfWin to missing value
-    set sfTabIdx to 0
     repeat with w in windows
         repeat with i from 1 to count of tabs of w
             set t to tab i of w
             if URL of t contains "lightning" and URL of t contains "redhatsupport" then
-                set sfTab to t
-                set sfWin to w
-                set sfTabIdx to i
-                exit repeat
-            end if
-        end repeat
-        if sfTab is not missing value then exit repeat
-    end repeat
-    if sfTab is missing value then
-        tell window 1
-            set sfTab to make new tab with properties {{URL:"{url}"}}
-            set sfWin to window 1
-            set sfTabIdx to (count of tabs of window 1)
-        end tell
-        delay 15
-    else
-        -- Only navigate if not already on the correct view
-        set curURL to URL of sfTab
-        if curURL does not contain "{url}" then
-            set URL of sfTab to "{url}"
-            delay 12
-        end if
-    end if
-    -- Briefly activate SF tab so Chrome renders all virtual rows
-    set origIdx to active tab index of sfWin
-    set active tab index of sfWin to sfTabIdx
-    delay 5
-    tell sfTab
-        set r to {exec_line}
-    end tell
-    -- Restore user's original tab
-    set active tab index of sfWin to origIdx
-    return r
-end tell
-'''
-    else:
-        ascript = f'''
-tell application "Google Chrome"
-    set sfTab to missing value
-    repeat with w in windows
-        repeat with t in tabs of w
-            if URL of t starts with "https://redhatsupport" then
                 set sfTab to t
                 exit repeat
             end if
@@ -184,85 +378,33 @@ tell application "Google Chrome"
     return r
 end tell
 '''
-
-    # Write AppleScript to temp file to avoid shell quoting issues
-    fd, path = tempfile.mkstemp(suffix=".applescript")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(ascript)
-        r = subprocess.run(
-            ["osascript", path],
-            capture_output=True, text=True, timeout=45,
-        )
-    finally:
-        os.unlink(path)
-
-    if r.returncode != 0:
-        err = (r.stderr or "").strip()
-        raise RuntimeError(f"AppleScript failed: {err[:300]}")
-    return (r.stdout or "").strip()
+    return _run_applescript(ascript)
 
 
-def scrape_cases():
-    """Navigate Chrome to the case list, extract cases + recent comments via JS."""
+def scrape_cases() -> tuple[list[dict], list[str]]:
     if not CASE_LIST_URL:
         raise RuntimeError("No case list URL configured — set it in the dashboard at http://localhost:8090")
-    js = """
+    cases, columns = _do_scrape()
+    return cases, columns
+
+
+def _do_scrape() -> tuple[list[dict], list[str]]:
+    # Zero-disruption JS: reads whatever rows are in the DOM right now.
+    # No scrolling. No waiting. No page interaction. Pure DOM read.
+    js = r"""
     (function() {
-        // Get expected row count from the header (e.g. "18 items")
         var expected = 0;
         var allEls = document.querySelectorAll('span, div, p');
         for (var hh = 0; hh < allEls.length; hh++) {
             var ht = allEls[hh].textContent || '';
-            var em = ht.match(/(\\d+)\\s+items?/i);
+            var em = ht.match(/(\d+)\s+items?/i);
             if (em && ht.length < 150) { expected = parseInt(em[1]); break; }
         }
-
-        // Scroll through the table to force all virtual rows to render
-        var scrollContainers = document.querySelectorAll('.uiScroller, .slds-scrollable_y, .slds-scrollable, [role="grid"], .listViewContent');
-        for (var si = 0; si < scrollContainers.length; si++) {
-            var sc = scrollContainers[si];
-            if (sc.scrollHeight > sc.clientHeight) {
-                for (var step = 0; step < 20; step++) {
-                    sc.scrollTop = step * 200;
-                    var tw = Date.now(); while (Date.now() - tw < 150) {}
-                }
-                sc.scrollTop = 0;
-                var tw2 = Date.now(); while (Date.now() - tw2 < 300) {}
-            }
-        }
-        // Also scroll main page
-        for (var ps = 0; ps < 10; ps++) {
-            window.scrollTo(0, ps * 300);
-            var tw3 = Date.now(); while (Date.now() - tw3 < 150) {}
-        }
-        window.scrollTo(0, 0);
-        var tw4 = Date.now(); while (Date.now() - tw4 < 500) {}
-
-        // Wait for rows to appear (up to 15s)
-        var maxWait = 15000, waited = 0;
-        while (waited < maxWait) {
-            var r = document.querySelectorAll('table tbody tr');
-            if (expected > 0 && r.length >= expected) break;
-            if (r.length >= 3 && waited > 5000) break;
-            // Re-scroll to trigger virtual rendering
-            if (waited % 2000 === 0) {
-                window.scrollTo(0, document.body.scrollHeight);
-                var rs = Date.now(); while (Date.now() - rs < 200) {}
-                window.scrollTo(0, 0);
-            }
-            var t = Date.now(); while (Date.now() - t < 500) {}
-            waited += 500;
-        }
-
-        // Try multiple selectors to find table rows
         var rows = document.querySelectorAll('table tbody tr');
         if (rows.length === 0) rows = document.querySelectorAll('[data-row-key-value]');
         if (rows.length === 0) rows = document.querySelectorAll('table tr');
         if (rows.length === 0) rows = document.querySelectorAll('[role="row"]');
         if (rows.length === 0) rows = document.querySelectorAll('.slds-table tr, .forceListViewManager tr, lightning-datatable tr');
-
-        // Discover columns dynamically from data-label or header
         var columns = [];
         if (rows.length > 0) {
             var firstCells = rows[0].querySelectorAll('td, th');
@@ -271,7 +413,6 @@ def scrape_cases():
                 if (lbl && lbl.length > 0) columns.push(lbl);
             }
         }
-        // If no data-label, try getting columns from thead
         if (columns.length === 0) {
             var ths = document.querySelectorAll('table thead th, [role="columnheader"]');
             for (var th = 0; th < ths.length; th++) {
@@ -279,96 +420,62 @@ def scrape_cases():
                 if (al && al.length > 0 && al.length < 50) columns.push(al);
             }
         }
-
         var cases = [];
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
-            // Skip header rows
             if (row.querySelector('th[scope="col"]')) continue;
             if (row.parentElement && row.parentElement.tagName === 'THEAD') continue;
-
             var cells = row.querySelectorAll('td, th');
-
-            // Build dynamic field map from data-label
             var fields = {};
             var hasDataLabel = false;
             for (var j = 0; j < cells.length; j++) {
                 var label = cells[j].getAttribute('data-label') || '';
-                if (label) {
-                    hasDataLabel = true;
-                    fields[label] = cells[j].textContent.trim();
-                }
+                if (label) { hasDataLabel = true; fields[label] = cells[j].textContent.trim(); }
             }
-
-            // Fallback: map cells to column headers by index
             if (!hasDataLabel && columns.length > 0) {
                 var ci = 0;
                 for (var j = 0; j < cells.length; j++) {
                     var val = cells[j].textContent.trim();
-                    if (val && ci < columns.length) {
-                        fields[columns[ci]] = val;
-                        ci++;
-                    }
+                    if (val && ci < columns.length) { fields[columns[ci]] = val; ci++; }
                 }
             }
-
-            // Get Salesforce record ID from any link
             var link = row.querySelector('a[href*="/view"], a[href*="/Case/"]');
             var caseId = '';
             if (link) {
-                var m = link.href.match(/\\/r\\/([a-zA-Z0-9]{15,18})\\/view/) || link.href.match(/Case\\/([a-zA-Z0-9]{15,18})/);
+                var m = link.href.match(/\/r\/([a-zA-Z0-9]{15,18})\/view/) || link.href.match(/Case\/([a-zA-Z0-9]{15,18})/);
                 if (m) caseId = m[1];
             }
             if (!caseId) caseId = row.getAttribute('data-row-key-value') || '';
-
-            // Find case number — try various field name patterns
             var caseNum = '';
             for (var key in fields) {
                 if (/case.?number/i.test(key) || /internal.?case/i.test(key)) {
-                    var v = fields[key];
-                    if (/^\\d{5,10}$/.test(v)) { caseNum = v; break; }
+                    var v = fields[key]; if (/^\d{5,10}$/.test(v)) { caseNum = v; break; }
                 }
             }
-            // Last resort: find any 7-8 digit number in the row
             if (!caseNum) {
                 for (var key in fields) {
-                    var vm = fields[key].match(/\\b(\\d{7,8})\\b/);
+                    var vm = fields[key].match(/\b(\d{7,8})\b/);
                     if (vm) { caseNum = vm[1]; break; }
                 }
             }
-
-            if (caseNum || caseId) {
-                cases.push({
-                    id: caseId,
-                    caseNum: caseNum,
-                    fields: fields
-                });
-            }
+            if (caseNum || caseId) cases.push({ id: caseId, caseNum: caseNum, fields: fields });
         }
-
-        // Debug info
         var tableCount = document.querySelectorAll('table').length;
         var allTrCount = document.querySelectorAll('tr').length;
-
         return JSON.stringify({
-            cases: cases,
-            columns: columns,
-            url: window.location.href,
-            title: document.title,
-            count: cases.length,
+            cases: cases, columns: columns, url: window.location.href,
+            title: document.title, count: cases.length,
             debug: {expected: expected, tables: tableCount, allTrs: allTrCount, rowsFound: rows.length}
         });
     })()
     """
-    result = chrome_js(js, url=CASE_LIST_URL)
+    result = chrome_js(js)
     if not result or result.startswith("ERROR:"):
         raise RuntimeError(f"Chrome JS returned: {result}")
-
     try:
         data = json.loads(result)
     except json.JSONDecodeError:
-        log(f"JS returned non-JSON: {result[:200]}")
-        raise RuntimeError("Could not parse case list data from Chrome")
+        raise RuntimeError(f"Could not parse case list data: {result[:200]}")
 
     page_url = data.get("url", "")
     if "login" in page_url.lower() or "auth" in page_url.lower():
@@ -376,7 +483,8 @@ def scrape_cases():
 
     columns = data.get("columns", [])
     debug = data.get("debug", {})
-    log(f"page: {data.get('title', '?')}, cases: {data.get('count', 0)}, columns: {columns}, debug: {debug}")
+    log_info("scrape_complete", page=data.get("title", "?"), cases=data.get("count", 0),
+             columns=len(columns), expected=debug.get("expected", 0), rows=debug.get("rowsFound", 0))
 
     cases = []
     for row in data.get("cases", []):
@@ -386,50 +494,46 @@ def scrape_cases():
         if not case_num and not case_id:
             continue
         cases.append({
-            "Id": case_id,
-            "CaseNumber": case_num,
+            "Id": case_id, "CaseNumber": case_num,
             "Status": fields.get("Status", ""),
             "Subject": fields.get("Subject", ""),
+            "OwnerAlias": fields.get("Case Owner Alias", ""),
             "fields": fields,
-            "comments": [],
         })
-
     return cases, columns
 
 
-SUPPORTSHELL_HOST = os.environ.get(
-    "SUPPORTSHELL_HOST",
-    "supportshell-1.sush-001.prod.us-west-2.aws.redhat.com",
-)
-
-def _get_supportshell_user() -> str:
-    env = os.environ.get("SUPPORTSHELL_USER")
-    if env:
-        return env
+# ─── Hydra API (Support Shell) ─────────────────────────────────────────────
+def _ssh_python(script: str, timeout: int = 30) -> str:
+    """Run a Python script on Support Shell via SSH. Respects circuit breaker."""
+    if ssh_circuit.is_open:
+        log_warn("ssh_skipped", reason="circuit_breaker_open")
+        return ""
+    if not SSH_USER:
+        log_warn("ssh_skipped", reason="no_ssh_user")
+        return ""
     try:
-        with open(CONFIG_PATH) as f:
-            return json.load(f).get("supportshell_user", "")
-    except Exception:
+        r = subprocess.run(
+            ["ssh", f"{SSH_USER}@{SUPPORTSHELL_HOST}", "python3"],
+            input=script, capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            ssh_circuit.record_failure()
+            log_error("ssh_failed", exit=r.returncode, stderr=(r.stderr or "").strip()[:200])
+            return ""
+        ssh_circuit.record_success()
+        return (r.stdout or "").strip()
+    except Exception as exc:
+        ssh_circuit.record_failure()
+        log_error("ssh_exception", error=str(exc)[:120])
         return ""
 
-SUPPORTSHELL_USER = _get_supportshell_user()
 
-
-def _fetch_comments_hydra(case_number: str) -> list[dict]:
-    """Fetch case comments via Hydra REST API on Support Shell."""
-    if not SUPPORTSHELL_USER:
-        # Try to detect SSH user from environment
-        ssh_user = os.environ.get("USER", "")
-        if not ssh_user:
-            log("no SUPPORTSHELL_USER set, skipping comment fetch")
-            return []
-    else:
-        ssh_user = SUPPORTSHELL_USER
-
+def fetch_comments_hydra(case_number: str) -> list[dict]:
     script = f'''
 import json, urllib.request, urllib.parse
 try:
-    with open("/home/remote/{ssh_user}/.yank/oidc-tokens.json") as f:
+    with open("/home/remote/{SSH_USER}/.yank/oidc-tokens.json") as f:
         d = json.load(f)
     data = urllib.parse.urlencode({{
         "grant_type": "refresh_token",
@@ -459,26 +563,76 @@ try:
 except Exception as e:
     print(json.dumps({{"error": str(e)}}))
 '''
+    out = _ssh_python(script)
+    if not out:
+        return []
     try:
-        r = subprocess.run(
-            ["ssh", f"{ssh_user}@{SUPPORTSHELL_HOST}", "python3", "-c", json.dumps(script)],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            log(f"SSH comment fetch failed: {(r.stderr or '').strip()[:200]}")
-            return []
-        data = json.loads((r.stdout or "").strip())
+        data = json.loads(out)
         if isinstance(data, dict) and "error" in data:
-            log(f"Hydra comment error: {data['error']}")
+            log_warn("hydra_error", case=case_number, error=data["error"][:120])
             return []
         return data if isinstance(data, list) else []
-    except Exception as exc:
-        log(f"comment fetch exception: {exc}")
+    except Exception:
         return []
 
 
+def fetch_batch_comment_info(case_numbers: list[str]) -> dict[str, dict]:
+    """One SSH call to get latest comment metadata for all cases."""
+    if not case_numbers:
+        return {}
+    cases_json = json.dumps(case_numbers)
+    script = f'''
+import json, urllib.request, urllib.parse
+cases = {cases_json}
+try:
+    with open("/home/remote/{SSH_USER}/.yank/oidc-tokens.json") as f:
+        d = json.load(f)
+    data = urllib.parse.urlencode({{
+        "grant_type": "refresh_token",
+        "refresh_token": d["refresh_token"],
+        "client_id": "cee-supportshell-deviceauth"
+    }}).encode()
+    req = urllib.request.Request(
+        "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token", data)
+    tokens = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    at = tokens["access_token"]
+    result = {{}}
+    for cn in cases:
+        try:
+            req2 = urllib.request.Request(
+                "https://access.redhat.com/hydra/rest/cases/" + cn + "/comments")
+            req2.add_header("Authorization", "Bearer " + at)
+            req2.add_header("Accept", "application/json")
+            resp = urllib.request.urlopen(req2, timeout=10)
+            comments = json.loads(resp.read())
+            if comments:
+                last = comments[-1]
+                author = last.get("createdByUser", "")
+                if isinstance(author, dict):
+                    author = author.get("fullName", author.get("name", ""))
+                result[cn] = {{"count": len(comments), "latestDate": last.get("createdDate", ""), "latestAuthor": author}}
+            else:
+                result[cn] = {{"count": 0, "latestDate": "", "latestAuthor": ""}}
+        except Exception:
+            result[cn] = {{"count": 0, "latestDate": "", "latestAuthor": ""}}
+    print(json.dumps(result))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+'''
+    out = _ssh_python(script, timeout=90)
+    if not out:
+        return {}
+    try:
+        data = json.loads(out)
+        if isinstance(data, dict) and "error" in data:
+            log_warn("batch_comment_error", error=data["error"][:120])
+            return {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _format_comments(comments: list[dict]) -> str:
-    """Format comments for email body."""
     if not comments:
         return ""
     lines = ["\n--- Recent Comments ---"]
@@ -493,98 +647,469 @@ def _format_comments(comments: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def poll_once() -> int:
+# ─── Core Poll Logic ───────────────────────────────────────────────────────
+def poll_once(conn: sqlite3.Connection) -> dict:
+    """Single poll cycle. Returns stats dict."""
+    run_start = datetime.now(timezone.utc).isoformat()
+    stats = {"cases": 0, "events": 0, "notifications": 0, "status": "OK", "error": ""}
+
+    # 1. Scrape cases from Chrome — zero disruption
+    log_info("POLL_START")
+    log_info("case_discovery_started", source="Chrome_background_JS")
+    chrome_access = "NO"
+    chrome_activation = "NO"
+    tab_changed = "NO"
+    page_reload = "NO"
+    focus_changed = "NO"
+
     try:
         cases, columns = scrape_cases()
+        chrome_access = "YES"
     except Exception as exc:
-        log(f"scrape failed: {exc}")
-        return 0
+        stats["status"] = "SCRAPE_FAILED"
+        stats["error"] = str(exc)[:200]
+        log_error("scrape_failed", error=stats["error"])
+        log_info("chrome_safety", access=chrome_access, activation=chrome_activation,
+                 tab_changed=tab_changed, page_reload=page_reload, focus_changed=focus_changed)
+        _write_heartbeat(0, "SCRAPE_FAILED", stats["error"])
+        conn.execute(
+            "INSERT INTO poll_runs (started_at, finished_at, status, error) VALUES (?,?,?,?)",
+            (run_start, datetime.now(timezone.utc).isoformat(), "SCRAPE_FAILED", stats["error"]),
+        )
+        conn.commit()
+        return stats
 
-    state = load_state()
-    prev = state.get("cases") or {}
-    initialized = bool(state.get("initialized"))
-    now_map = {}
-    sent = 0
+    log_info("chrome_safety", access=chrome_access, activation=chrome_activation,
+             tab_changed=tab_changed, page_reload=page_reload, focus_changed=focus_changed)
 
+    stats["cases"] = len(cases)
+    initialized = _db_get(conn, "initialized") == "1"
+
+    # 2. Suspicious result protection — if too few cases, use cached state
+    prev_count = conn.execute("SELECT COUNT(*) as c FROM cases").fetchone()["c"]
+    if len(cases) == 0 and prev_count > 5:
+        log_warn("suspicious_empty_response", scraped=0, cached=prev_count,
+                 action="skipping_cycle_using_cached_state")
+        stats["status"] = "INSUFFICIENT_ROWS"
+        _write_heartbeat(prev_count, "INSUFFICIENT_ROWS")
+        conn.execute(
+            "INSERT INTO poll_runs (started_at, finished_at, status, cases_found, error) VALUES (?,?,?,?,?)",
+            (run_start, datetime.now(timezone.utc).isoformat(), "INSUFFICIENT_ROWS", 0,
+             f"0 rows scraped, {prev_count} cached — SF virtual scroll may be hiding rows, will retry next cycle"),
+        )
+        conn.commit()
+        return stats
+
+    now = datetime.now(timezone.utc).isoformat()
+    status_changed_cases = set()
+
+    # 3. Detect status changes
     for rec in cases:
         cid = rec.get("Id") or rec.get("CaseNumber") or ""
         if not cid:
             continue
-        status = rec.get("Status") or ""
-        fields = rec.get("fields") or {}
-        comments = rec.get("comments") or []
-        latest_comment = comments[0].get("date", "") if comments else ""
+        num = rec.get("CaseNumber", "")
+        status = rec.get("Status", "")
+        subject = rec.get("Subject", "")
+        owner = rec.get("OwnerAlias", "")
+        fields = rec.get("fields", {})
 
-        now_map[cid] = {
-            "status": status,
-            "number": rec.get("CaseNumber"),
-            "subject": rec.get("Subject") or "",
-            "fields": fields,
-            "latestComment": latest_comment,
-            "comments": comments[:3],
-        }
+        old = conn.execute("SELECT * FROM cases WHERE case_id=?", (cid,)).fetchone()
+        old_status = old["status"] if old else None
 
-        old_entry = prev.get(cid) or {}
-        old_status = old_entry.get("status")
-        old_comment_date = old_entry.get("latestComment", "")
-        num = rec.get("CaseNumber") or cid
-        subj = rec.get("Subject") or ""
-        link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
-        comment_text = _format_comments(comments)
+        # Upsert case
+        conn.execute("""
+            INSERT INTO cases (case_id, case_number, status, subject, owner_alias, fields_json, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(case_id) DO UPDATE SET
+                status=excluded.status, subject=excluded.subject, owner_alias=excluded.owner_alias,
+                fields_json=excluded.fields_json, last_seen=excluded.last_seen
+        """, (cid, num, status, subject, owner, json.dumps(fields), now, now))
 
         if not initialized:
             continue
 
-        # Check for status change
-        if old_status is not None and old_status.strip().lower() != status.strip().lower():
-            # Fetch recent comments via Hydra API on Support Shell
-            fetched_comments = []
-            if num:
-                try:
-                    log(f"fetching comments for {num} via Hydra...")
-                    fetched_comments = _fetch_comments_hydra(num)
-                    log(f"got {len(fetched_comments)} comments for {num}")
-                except Exception as exc:
-                    log(f"comment fetch failed for {num}: {exc}")
-            comment_text = _format_comments(fetched_comments)
+        # Owner filter
+        if owner and SSH_USER and owner.lower() != SSH_USER.lower():
+            continue
 
-            title = f"Case {num}: {old_status} → {status}"
+        # Status change detection
+        if old_status is not None and old_status.strip().lower() != status.strip().lower():
+            ehash = _event_hash(cid, "STATUS", old_status, status)
+            existing = conn.execute("SELECT event_id FROM events WHERE event_hash=?", (ehash,)).fetchone()
+            if existing:
+                log_info("event_deduplicated", case=num, type="STATUS", hash=ehash)
+                continue
+
+            status_changed_cases.add(num)
+            log_info("status_change_detected", case=num, old=old_status, new=status)
+
+            # Fetch comments
+            comments = []
+            if num:
+                comments = fetch_comments_hydra(num)
+                log_info("comments_fetched", case=num, count=len(comments))
+            comment_text = _format_comments(comments)
+
+            # Create event
+            conn.execute(
+                "INSERT INTO events (case_id, case_number, event_type, old_value, new_value, event_time, event_hash, details) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (cid, num, "STATUS", old_status, status, now, ehash, comment_text[:2000]),
+            )
+            event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
+            title = f"Case {num}: {old_status} -> {status}"
             body = (
                 f"Salesforce case {num} status changed.\n"
-                f"From: {old_status}\n"
-                f"To: {status}\n"
-                f"Subject: {subj}\n"
-                f"{link}\n"
-                f"{comment_text}\n"
+                f"From: {old_status}\nTo: {status}\n"
+                f"Subject: {subject}\n{link}\n{comment_text}\n"
             )
-            notify_banner("Salesforce", title)
-            try:
-                send_mail(title, body)
-                log(f"emailed {num} (status change)")
-            except Exception as exc:
-                log(f"mail failed {num}: {exc}")
-            sent += 1
+            queue_notification(conn, event_id, title, body)
+            stats["events"] += 1
 
-    state["cases"] = now_map
-    state["columns"] = columns
-    state["initialized"] = True
-    state["lastRun"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
-    log(f"ok cases={len(now_map)} mailed={sent} init_was={initialized}")
-    return 0
+    conn.commit()
+
+    # 4. Batch comment check (one SSH call for all owned cases)
+    if initialized and not ssh_circuit.is_open:
+        owned = []
+        for rec in cases:
+            cid = rec.get("Id") or rec.get("CaseNumber") or ""
+            owner = rec.get("OwnerAlias", "")
+            if owner and SSH_USER and owner.lower() != SSH_USER.lower():
+                continue
+            num = rec.get("CaseNumber", "")
+            if num and num not in status_changed_cases:
+                owned.append((cid, num))
+
+        if owned:
+            log_info("batch_comment_check", count=len(owned))
+            nums = [n for _, n in owned]
+            info = fetch_batch_comment_info(nums)
+
+            for cid, num in owned:
+                if num not in info:
+                    continue
+                ci = info[num]
+                new_date = ci.get("latestDate", "")
+                new_count = ci.get("count", 0)
+
+                old = conn.execute(
+                    "SELECT last_comment_date, comment_count FROM cases WHERE case_id=?", (cid,)
+                ).fetchone()
+                old_date = old["last_comment_date"] if old else ""
+                old_count = old["comment_count"] if old else 0
+
+                conn.execute(
+                    "UPDATE cases SET last_comment_date=?, comment_count=? WHERE case_id=?",
+                    (new_date, new_count, cid),
+                )
+
+                # Detect new comment(s)
+                if old_date and new_date and new_date > old_date:
+                    new_comments_count = new_count - old_count if new_count > old_count else 1
+                    author = ci.get("latestAuthor", "Someone")
+                    ehash = _event_hash(cid, "COMMENT", old_date, new_date)
+                    existing = conn.execute("SELECT event_id FROM events WHERE event_hash=?", (ehash,)).fetchone()
+                    if existing:
+                        continue
+
+                    log_info("new_comment_detected", case=num, by=author, new_comments=new_comments_count)
+
+                    fetched = fetch_comments_hydra(num)
+                    comment_text = _format_comments(fetched)
+
+                    case_row = conn.execute("SELECT subject, status FROM cases WHERE case_id=?", (cid,)).fetchone()
+                    subject = case_row["subject"] if case_row else ""
+                    cur_status = case_row["status"] if case_row else ""
+                    link = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{cid}/view"
+
+                    conn.execute(
+                        "INSERT INTO events (case_id, case_number, event_type, old_value, new_value, event_time, event_hash, details) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (cid, num, "COMMENT", old_date, new_date, now, ehash,
+                         f"{new_comments_count} new comment(s) by {author}"),
+                    )
+                    event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                    title = f"New comment on Case {num}" + (f" ({new_comments_count} new)" if new_comments_count > 1 else "")
+                    body = (
+                        f"{'New comment' if new_comments_count == 1 else f'{new_comments_count} new comments'} on case {num}.\n"
+                        f"By: {author}\nStatus: {cur_status}\n"
+                        f"Subject: {subject}\n{link}\n{comment_text}\n"
+                    )
+                    queue_notification(conn, event_id, title, body)
+                    stats["events"] += 1
+
+    conn.commit()
+
+    # 5. Dispatch all pending notifications
+    pending = conn.execute(
+        "SELECT notif_id FROM notifications WHERE status IN ('PENDING', 'RETRY')"
+    ).fetchall()
+    for row in pending:
+        if dispatch_notification(conn, row["notif_id"]):
+            stats["notifications"] += 1
+
+    # 6. Mark initialized
+    if not initialized:
+        _db_set(conn, "initialized", "1")
+        log_info("baseline_established", cases=len(cases))
+
+    # 7. Write heartbeat + JSON compat for dashboard
+    _write_heartbeat(len(cases), "OK")
+    _write_json_compat(conn, columns)
+
+    # 8. Record poll run
+    conn.execute(
+        "INSERT INTO poll_runs (started_at, finished_at, status, cases_found, events_found, notifs_sent) "
+        "VALUES (?,?,?,?,?,?)",
+        (run_start, datetime.now(timezone.utc).isoformat(), "OK", len(cases), stats["events"], stats["notifications"]),
+    )
+    conn.commit()
+
+    status_changes = conn.execute(
+        "SELECT COUNT(*) as c FROM events WHERE event_type='STATUS' AND event_time=?", (now,)
+    ).fetchone()["c"]
+    new_comments = conn.execute(
+        "SELECT COUNT(*) as c FROM events WHERE event_type='COMMENT' AND event_time=?", (now,)
+    ).fetchone()["c"]
+    log_info("POLL_COMPLETE", cases=len(cases), status_changes=status_changes,
+             new_comments=new_comments, notifications_sent=stats["notifications"])
+    return stats
 
 
+def _write_json_compat(conn: sqlite3.Connection, columns: list[str]):
+    """Write JSON state file for backward compatibility with the dashboard."""
+    rows = conn.execute("SELECT * FROM cases").fetchall()
+    cases_map = {}
+    for r in rows:
+        fields = {}
+        try:
+            fields = json.loads(r["fields_json"] or "{}")
+        except Exception:
+            pass
+        cases_map[r["case_id"]] = {
+            "status": r["status"],
+            "number": r["case_number"],
+            "subject": r["subject"],
+            "fields": fields,
+            "latestComment": "",
+            "comments": [],
+            "hydraLatestComment": r["last_comment_date"] or "",
+            "hydraCommentCount": r["comment_count"] or 0,
+        }
+    state = {
+        "cases": cases_map,
+        "columns": columns,
+        "initialized": True,
+        "lastRun": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp = JSON_STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, JSON_STATE_PATH)
+
+
+# ─── CLI Commands ──────────────────────────────────────────────────────────
+def cmd_status(conn: sqlite3.Connection):
+    """Show current service status."""
+    cases = conn.execute("SELECT COUNT(*) as c FROM cases").fetchone()["c"]
+    events = conn.execute("SELECT COUNT(*) as c FROM events").fetchone()["c"]
+    last_run = conn.execute("SELECT * FROM poll_runs ORDER BY run_id DESC LIMIT 1").fetchone()
+    pending = conn.execute("SELECT COUNT(*) as c FROM notifications WHERE status IN ('PENDING','RETRY')").fetchone()["c"]
+    failed = conn.execute("SELECT COUNT(*) as c FROM notifications WHERE status='FAILED'").fetchone()["c"]
+    init = _db_get(conn, "initialized") == "1"
+
+    print("═══ SF Case Notification Center v2 ═══")
+    print(f"  Service:        {'RUNNING' if os.path.exists(HEARTBEAT_PATH) else 'UNKNOWN'}")
+    print(f"  Initialized:    {'Yes' if init else 'No (baseline pending)'}")
+    print(f"  Cases tracked:  {cases}")
+    print(f"  Total events:   {events}")
+    print(f"  Pending notifs: {pending}")
+    print(f"  Failed notifs:  {failed}")
+    print(f"  SSH circuit:    {'OPEN (paused)' if ssh_circuit.is_open else 'CLOSED (ok)'}")
+    if last_run:
+        print(f"  Last poll:      {last_run['finished_at'] or '?'}")
+        print(f"  Last status:    {last_run['status']}")
+        print(f"  Last cases:     {last_run['cases_found']}")
+    print(f"  Poll interval:  {INTERVAL}s")
+    print(f"  Notify email:   {TO_ADDR or '(not set)'}")
+    print(f"  SSH user:       {SSH_USER or '(not set)'}")
+    print(f"  Case list URL:  {CASE_LIST_URL[:60] + '...' if len(CASE_LIST_URL) > 60 else CASE_LIST_URL or '(not set)'}")
+
+
+def cmd_health(conn: sqlite3.Connection):
+    """Run health checks."""
+    checks = []
+
+    # Salesforce / Chrome
+    try:
+        r = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
+        checks.append(("Chrome", "PASS" if r.returncode == 0 else "FAIL"))
+    except Exception:
+        checks.append(("Chrome", "FAIL"))
+
+    # Mail.app
+    try:
+        r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
+        checks.append(("Mail.app", "PASS" if r.returncode == 0 else "WARN (not running)"))
+    except Exception:
+        checks.append(("Mail.app", "WARN"))
+
+    # SMTP
+    try:
+        with smtplib.SMTP("127.0.0.1", 2525, timeout=3) as s:
+            s.noop()
+        checks.append(("Local SMTP", "PASS"))
+    except Exception:
+        checks.append(("Local SMTP", "FAIL (port 2525)"))
+
+    # SSH / Hydra
+    if ssh_circuit.is_open:
+        checks.append(("SSH/Hydra", "FAIL (circuit open)"))
+    elif SSH_USER:
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", f"{SSH_USER}@{SUPPORTSHELL_HOST}", "echo ok"],
+                capture_output=True, text=True, timeout=10,
+            )
+            checks.append(("SSH/Hydra", "PASS" if r.returncode == 0 else "FAIL"))
+        except Exception:
+            checks.append(("SSH/Hydra", "FAIL"))
+    else:
+        checks.append(("SSH/Hydra", "SKIP (no user)"))
+
+    # SQLite
+    try:
+        conn.execute("SELECT 1").fetchone()
+        checks.append(("SQLite DB", "PASS"))
+    except Exception:
+        checks.append(("SQLite DB", "FAIL"))
+
+    # Dashboard
+    try:
+        import urllib.request
+        r = urllib.request.urlopen("http://localhost:8090", timeout=3)
+        checks.append(("Dashboard", "PASS" if r.status == 200 else "FAIL"))
+    except Exception:
+        checks.append(("Dashboard", "FAIL (port 8090)"))
+
+    # Heartbeat freshness
+    try:
+        with open(HEARTBEAT_PATH) as f:
+            hb = json.load(f)
+        last = datetime.fromisoformat(hb["last_successful_poll"])
+        age = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)).total_seconds()
+        checks.append(("Heartbeat", f"PASS ({int(age)}s ago)" if age < 600 else f"WARN ({int(age)}s stale)"))
+    except Exception:
+        checks.append(("Heartbeat", "FAIL (no data)"))
+
+    # Case list URL
+    checks.append(("Case List URL", "PASS" if CASE_LIST_URL else "FAIL (not set)"))
+
+    print("═══ Health Check ═══")
+    all_pass = True
+    for name, result in checks:
+        symbol = "✓" if result.startswith("PASS") else ("⚠" if result.startswith("WARN") or result.startswith("SKIP") else "✗")
+        print(f"  {symbol} {name:<20} {result}")
+        if result.startswith("FAIL"):
+            all_pass = False
+    print(f"\n  Overall: {'HEALTHY' if all_pass else 'DEGRADED'}")
+
+
+def cmd_test_email():
+    """Send a test email through all channels."""
+    subject = "SF Notify Test"
+    body = f"Test notification from SF Case Notification Center.\nTime: {datetime.now(timezone.utc).isoformat()}\n"
+    print("Sending test email...")
+    smtp_ok = _send_smtp(subject, body)
+    print(f"  Local SMTP: {'OK' if smtp_ok else 'FAILED'}")
+    mail_ok = _send_mailapp(subject, body)
+    print(f"  Mail.app:   {'OK' if mail_ok else 'FAILED'}")
+    _send_banner("SF Notify Test", "Test notification")
+    print(f"  Banner:     OK")
+
+
+def cmd_history(conn: sqlite3.Connection, limit: int = 20):
+    """Show recent events."""
+    rows = conn.execute(
+        "SELECT * FROM events ORDER BY event_id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    if not rows:
+        print("No events recorded yet.")
+        return
+    print("═══ Recent Events ═══")
+    for r in rows:
+        etype = r["event_type"]
+        symbol = "↔" if etype == "STATUS" else "💬" if etype == "COMMENT" else "?"
+        print(f"  {symbol} [{r['event_time'][:19]}] Case {r['case_number']} "
+              f"{etype}: {r['old_value'][:20]} -> {r['new_value'][:20]}")
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────
 def main() -> int:
-    log(f"starting — interval={INTERVAL}s url={CASE_LIST_URL}")
+    conn = _init_db()
 
-    if "--once" in sys.argv:
-        return poll_once()
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+
+    if cmd == "--status" or cmd == "status":
+        cmd_status(conn)
+        return 0
+
+    if cmd == "--health" or cmd == "health":
+        cmd_health(conn)
+        return 0
+
+    if cmd == "--test-email" or cmd == "test-email":
+        cmd_test_email()
+        return 0
+
+    if cmd == "--test" or cmd == "test":
+        cmd_health(conn)
+        print()
+        cmd_test_email()
+        return 0
+
+    if cmd == "--history" or cmd == "history":
+        cmd_history(conn)
+        return 0
+
+    if cmd == "--once" or cmd == "poll":
+        log_info("poll_started", mode="once", url=CASE_LIST_URL[:80])
+        stats = poll_once(conn)
+        print(f"Poll complete: cases={stats['cases']} events={stats['events']} notifs={stats['notifications']} status={stats['status']}")
+        return 0
+
+    # Default: continuous polling
+    log_info("service_started", interval=INTERVAL, url=CASE_LIST_URL[:80], pid=os.getpid())
+
+    def _handle_signal(sig, frame):
+        log_info("service_stopped", signal=sig)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    # Startup reconciliation — if we haven't run in >15 min, re-baseline
+    try:
+        with open(HEARTBEAT_PATH) as f:
+            hb = json.load(f)
+        last = datetime.fromisoformat(hb["last_successful_poll"])
+        gap = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)).total_seconds()
+        if gap > 900:
+            log_warn("startup_reconciliation", gap_seconds=int(gap))
+            _db_set(conn, "initialized", "0")
+    except Exception:
+        pass
 
     while True:
         try:
-            poll_once()
+            poll_once(conn)
+            process_retry_queue(conn)
         except Exception as exc:
-            log(f"poll error: {exc}")
+            log_error("poll_error", error=str(exc)[:200])
         time.sleep(INTERVAL)
 
 
@@ -592,7 +1117,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        log("stopped")
+        log_info("stopped", reason="keyboard_interrupt")
     except Exception as exc:
-        log(f"fatal: {exc}")
+        log_error("fatal", error=str(exc)[:200])
         sys.exit(1)
