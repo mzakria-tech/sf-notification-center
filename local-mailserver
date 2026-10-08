@@ -57,13 +57,15 @@ def _check_service(name: str) -> dict:
     """Check if a service is running."""
     if name == "poller":
         r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        running = "com.sf-notify.case-poller" in (r.stdout or "")
+        running = "com.mzakria.sf-case-poller" in (r.stdout or "")
         return {"running": running, "label": "SF Case Poller"}
     elif name == "mailserver":
         return {"running": True, "label": "Mail Server"}
     elif name == "chrome":
-        r = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
-        return {"running": r.returncode == 0, "label": "Google Chrome"}
+        r = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                            "mzakria@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com", "echo ok"],
+                           capture_output=True, text=True, timeout=10)
+        return {"running": "ok" in (r.stdout or ""), "label": "SSH/GraphQL"}
     elif name == "mailapp":
         r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
         return {"running": r.returncode == 0, "label": "Mail.app"}
@@ -295,8 +297,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     {pl_fix}
   </div>
   <div class="svc green">
-    <div class="svc-icon">🌐</div>
-    <div class="svc-label">Chrome</div>
+    <div class="svc-icon">🔗</div>
+    <div class="svc-label">SSH/GraphQL</div>
     <div class="svc-status {cr_cls}"><div class="dot {cr_cls}"></div>{cr_text}</div>
     {cr_fix}
   </div>
@@ -339,7 +341,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <!-- How it works -->
 <div class="section-title"><span class="icon">⚡</span> How It Works</div>
 <div class="flow">
-  <div class="flow-step"><div class="flow-num" style="background:#3b82f6">1</div><div class="flow-text">Chrome reads Salesforce case list</div></div>
+  <div class="flow-step"><div class="flow-num" style="background:#3b82f6">1</div><div class="flow-text">GraphQL API fetches your cases</div></div>
   <div class="flow-arrow">→</div>
   <div class="flow-step"><div class="flow-num" style="background:#8b5cf6">2</div><div class="flow-text">Compares status with last poll</div></div>
   <div class="flow-arrow">→</div>
@@ -427,7 +429,7 @@ def _render(data: dict) -> str:
 
     ms_fix = "" if data["mailserver"]["running"] else start_btn("mailserver", "▶ Start Mail Server")
     pl_fix = "" if data["poller"]["running"] else start_btn("poller", "▶ Start Poller")
-    cr_fix = "" if data["chrome"]["running"] else start_btn("chrome", "▶ Open Chrome")
+    cr_fix = "" if data["chrome"]["running"] else '<div class="svc-fix">SSH to supportshell not reachable</div>'
     ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
 
     # Cases table — dynamically match Salesforce columns
@@ -570,7 +572,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 r = subprocess.run(["launchctl", "load", os.path.expanduser("~/Library/LaunchAgents/com.sf-notify.case-poller.plist")], capture_output=True, text=True)
                 result = {"ok": r.returncode == 0, "msg": (r.stderr or r.stdout or "started").strip()}
             elif svc == "chrome":
-                r = subprocess.run(["open", "-a", "Google Chrome"], capture_output=True, text=True)
+                r = subprocess.CompletedProcess(args=[], returncode=0, stdout="SSH check only")
                 result = {"ok": r.returncode == 0, "msg": "opened"}
             elif svc == "mailapp":
                 r = subprocess.run(["open", "-a", "Mail"], capture_output=True, text=True)
