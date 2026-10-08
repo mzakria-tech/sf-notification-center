@@ -1333,20 +1333,21 @@ def cmd_health(conn: sqlite3.Connection):
     except Exception:
         checks.append(("Local SMTP", "FAIL (port 2525)"))
 
-    # SSH / Hydra
+    # SSH + GraphQL
     if ssh_circuit.is_open:
-        checks.append(("SSH/Hydra", "FAIL (circuit open)"))
+        checks.append(("SSH/GraphQL", "FAIL (circuit open)"))
     elif SSH_USER:
         try:
             r = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=5", f"{SSH_USER}@{SUPPORTSHELL_HOST}", "echo ok"],
-                capture_output=True, text=True, timeout=10,
+                ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+                 f"{SSH_USER}@{SUPPORTSHELL_HOST}", "echo ok"],
+                capture_output=True, text=True, timeout=15,
             )
-            checks.append(("SSH/Hydra", "PASS" if r.returncode == 0 else "FAIL"))
+            checks.append(("SSH/GraphQL", "PASS" if r.returncode == 0 else "FAIL"))
         except Exception:
-            checks.append(("SSH/Hydra", "FAIL"))
+            checks.append(("SSH/GraphQL", "FAIL"))
     else:
-        checks.append(("SSH/Hydra", "SKIP (no user)"))
+        checks.append(("SSH/GraphQL", "SKIP (no user)"))
 
     # SQLite
     try:
