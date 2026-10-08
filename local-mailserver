@@ -60,33 +60,19 @@ class MailHandler(Message):
 
 
 def _check_service(name: str) -> dict:
-    """Check if a service is running. Returns running, label, and fix hint."""
-    cfg = _read_config()
-    ssh_user = cfg.get("supportshell_user", _USER)
-    ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
-
+    """Check if a service is running."""
     if name == "poller":
         r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        running = POLLER_LABEL in (r.stdout or "")
-        return {"running": running, "label": "SF Case Poller",
-                "fix": "Run: bash install.sh"}
+        running = "com.mzakria.sf-case-poller" in (r.stdout or "")
+        return {"running": running, "label": "SF Case Poller"}
     elif name == "mailserver":
-        return {"running": True, "label": "Mail Server", "fix": ""}
-    elif name == "ssh":
-        has_key = os.path.exists(os.path.expanduser("~/.ssh/id_rsa.pub")) or os.path.exists(os.path.expanduser("~/.ssh/id_ed25519.pub"))
-        if not has_key:
-            return {"running": False, "label": "SSH Key",
-                    "fix": f"Run: ssh-keygen && ssh-copy-id {ssh_host}"}
-        return {"running": SSH_STATUS["running"], "label": "SSH/GraphQL",
-                "fix": f"Run: ssh-copy-id {ssh_host}"}
-    elif name == "gql_token":
-        return {"running": SSH_STATUS["running"], "label": "GraphQL Token",
-                "fix": f"Run: ssh {ssh_host} then: redhat-hydra-auth --production"}
+        return {"running": True, "label": "Mail Server"}
+    elif name == "chrome":
+        return {"running": SSH_STATUS["running"], "label": "SSH/GraphQL"}
     elif name == "mailapp":
         r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
-        return {"running": r.returncode == 0, "label": "Mail.app",
-                "fix": "Open Mail.app and sign into your email account"}
-    return {"running": False, "label": name, "fix": ""}
+        return {"running": r.returncode == 0, "label": "Mail.app"}
+    return {"running": False, "label": name}
 
 
 def _read_cases() -> tuple[list[dict], list[str]]:
@@ -129,7 +115,7 @@ def _last_log_lines(n=5) -> list[str]:
 def _get_status_data() -> dict:
     """Gather all live status data."""
     poller = _check_service("poller")
-    chrome = _check_service("ssh")
+    chrome = _check_service("chrome")
     mailapp = _check_service("mailapp")
     state = _read_state()
     cases, columns = _read_cases()
@@ -328,6 +314,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
 </div>
 
+<!-- Fix All Button -->
+<div style="text-align:center;margin-bottom:16px">
+  <button class="start-btn" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:8px 24px;font-size:13px;border-radius:8px" onclick="startService('fix_all', this)">🔧 Fix All Services</button>
+</div>
+
 <!-- Stats -->
 <div class="stats">
   <div class="stat">
@@ -390,8 +381,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 }
 
 function startService(svc, btn) {
-    btn.textContent = 'Starting...';
+    var origText = btn.textContent;
+    btn.textContent = svc === 'fix_all' ? '🔧 Fixing...' : '⏳ Working...';
     btn.classList.add('loading');
+    btn.disabled = true;
     fetch('/api/start', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -399,19 +392,23 @@ function startService(svc, btn) {
     })
     .then(r => r.json())
     .then(d => {
+        btn.classList.remove('loading');
         if (d.ok) {
-            btn.textContent = '✓ Started!';
-            btn.classList.remove('loading');
+            btn.textContent = '✓ ' + (d.msg || 'Done!');
             btn.classList.add('done');
-            setTimeout(() => location.reload(), 2000);
+            btn.style.background = '#22c55e';
+            setTimeout(() => location.reload(), 2500);
         } else {
-            btn.textContent = '✗ Failed: ' + d.msg;
-            btn.classList.remove('loading');
+            btn.textContent = '✗ ' + (d.msg || 'Failed');
+            btn.style.background = '#ef4444';
+            setTimeout(() => { btn.textContent = origText; btn.style.background = ''; btn.disabled = false; }, 5000);
         }
     })
     .catch(() => {
-        btn.textContent = '✗ Error';
+        btn.textContent = '✗ Network error';
         btn.classList.remove('loading');
+        btn.style.background = '#ef4444';
+        setTimeout(() => { btn.textContent = origText; btn.style.background = ''; btn.disabled = false; }, 3000);
     });
 }
 </script>
@@ -459,21 +456,10 @@ def _render(data: dict) -> str:
     def start_btn(svc_id, label="▶ Start"):
         return f'<button class="start-btn" onclick="startService(\'{svc_id}\', this)">{label}</button>'
 
-    def fix_cmd(svc_data, btn_id=None, btn_label=None):
-        if svc_data["running"]:
-            return ""
-        fix = svc_data.get("fix", "")
-        html = ""
-        if btn_id and btn_label:
-            html += start_btn(btn_id, btn_label)
-        if fix:
-            html += f'<div class="fix-cmd">{fix}</div>'
-        return html
-
-    ms_fix = fix_cmd(data["mailserver"])
-    pl_fix = fix_cmd(data["poller"], "poller", "▶ Start Poller")
-    cr_fix = fix_cmd(data["chrome"])
-    ma_fix = fix_cmd(data["mailapp"], "mailapp", "▶ Open Mail.app")
+    ms_fix = "" if data["mailserver"]["running"] else start_btn("mailserver", "▶ Start Mail Server")
+    pl_fix = "" if data["poller"]["running"] else start_btn("poller", "▶ Start Poller")
+    cr_fix = "" if data["chrome"]["running"] else start_btn("ssh", "🔧 Test SSH")
+    ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
 
     # Cases table — dynamically match Salesforce columns
     cases = data["cases"]
@@ -602,7 +588,7 @@ def _render(data: dict) -> str:
 
 class WebHandler(BaseHTTPRequestHandler):
     def do_POST(self):
-        """Handle service start requests from dashboard."""
+        """Handle fix/start requests from dashboard buttons."""
         if self.path == "/api/start":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length).decode() if length else ""
@@ -612,17 +598,77 @@ class WebHandler(BaseHTTPRequestHandler):
                 req = {}
             svc = req.get("service", "")
             result = {"ok": False, "msg": "unknown service"}
+
             if svc == "poller":
-                r = subprocess.run(["launchctl", "load", os.path.expanduser("~/Library/LaunchAgents/com.sf-notify.case-poller.plist")], capture_output=True, text=True)
-                result = {"ok": r.returncode == 0, "msg": (r.stderr or r.stdout or "started").strip()}
-            elif svc == "chrome":
-                r = subprocess.CompletedProcess(args=[], returncode=0, stdout="SSH check only")
-                result = {"ok": r.returncode == 0, "msg": "opened"}
+                plist = os.path.join(LAUNCH_DIR, f"{POLLER_LABEL}.plist")
+                subprocess.run(["launchctl", "unload", plist], capture_output=True, timeout=5)
+                time.sleep(1)
+                subprocess.run(["launchctl", "load", plist], capture_output=True, timeout=5)
+                subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
+                result = {"ok": True, "msg": "Poller restarted"}
+                _watchdog_log("✓ Poller restarted (dashboard button)")
+
+            elif svc == "ssh":
+                # Test SSH and report
+                try:
+                    cfg = _read_config()
+                    ssh_user = cfg.get("supportshell_user", "mzakria")
+                    ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+                    r = subprocess.run(
+                        ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host, "echo ok"],
+                        capture_output=True, text=True, timeout=15)
+                    if "ok" in (r.stdout or ""):
+                        SSH_STATUS["running"] = True
+                        result = {"ok": True, "msg": "SSH connected OK"}
+                        _watchdog_log("✓ SSH tested OK (dashboard button)")
+                    else:
+                        result = {"ok": False, "msg": f"SSH failed: {(r.stderr or '').strip()[:80]}"}
+                        _watchdog_log("✗ SSH test failed (dashboard button)")
+                except subprocess.TimeoutExpired:
+                    result = {"ok": False, "msg": "SSH timed out — check VPN"}
+                except Exception as e:
+                    result = {"ok": False, "msg": str(e)[:80]}
+
             elif svc == "mailapp":
-                r = subprocess.run(["open", "-a", "Mail"], capture_output=True, text=True)
-                result = {"ok": r.returncode == 0, "msg": "opened"}
+                subprocess.run(["open", "-a", "Mail"], capture_output=True, text=True, timeout=10)
+                result = {"ok": True, "msg": "Mail.app opened"}
+                _watchdog_log("✓ Mail.app opened (dashboard button)")
+
             elif svc == "mailserver":
-                result = {"ok": True, "msg": "already running"}
+                result = {"ok": True, "msg": "Already running (you're looking at it)"}
+
+            elif svc == "fix_all":
+                steps = []
+                # Fix poller
+                plist = os.path.join(LAUNCH_DIR, f"{POLLER_LABEL}.plist")
+                subprocess.run(["launchctl", "unload", plist], capture_output=True, timeout=5)
+                time.sleep(1)
+                subprocess.run(["launchctl", "load", plist], capture_output=True, timeout=5)
+                subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
+                steps.append("Poller restarted")
+                # Fix Mail.app
+                subprocess.run(["open", "-gja", "Mail"], capture_output=True, timeout=10)
+                steps.append("Mail.app started")
+                # Clear stuck notifications
+                try:
+                    import sqlite3
+                    db = os.path.expanduser("~/.local/state/sf-notification-center.db")
+                    c = sqlite3.connect(db, timeout=5)
+                    c.execute("UPDATE notifications SET status='PENDING', retry_count=0 WHERE status='RETRY'")
+                    c.commit()
+                    c.close()
+                    steps.append("Stuck notifications cleared")
+                except Exception:
+                    pass
+                # Trigger immediate poll
+                python = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
+                subprocess.Popen(
+                    [python, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                steps.append("Immediate poll triggered")
+                result = {"ok": True, "msg": " → ".join(steps)}
+                _watchdog_log("✓ Fix All executed (dashboard button)")
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -644,7 +690,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 # Restart poller with new URL
                 plist = os.path.expanduser("~/Library/LaunchAgents/com.sf-notify.case-poller.plist")
                 subprocess.run(["launchctl", "unload", plist], capture_output=True)
-                import time; time.sleep(1)
+                __import__('time').sleep(1)
                 # Clear state so it re-initialises with new view
                 state_f = os.path.expanduser("~/.local/state/sf-case-status.json")
                 if os.path.exists(state_f):
