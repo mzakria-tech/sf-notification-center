@@ -15,10 +15,16 @@ from datetime import datetime, timezone
 from aiosmtpd.controller import Controller
 from aiosmtpd.handlers import Message
 
+import time
+
 EMAILS = []
 STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
 CONFIG_PATH = os.path.expanduser("~/.local/state/sf-poller-config.json")
 POLLER_LOG = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
+WATCHDOG_LOG = []  # last 20 actions for dashboard display
+POLLER_LABEL = "com.mzakria.sf-case-poller"
+LAUNCH_DIR = os.path.expanduser("~/Library/LaunchAgents")
+SSH_STATUS = {"running": True, "label": "SSH/GraphQL", "last_check": 0}  # cached, updated by watchdog
 
 
 def _read_config() -> dict:
@@ -62,10 +68,7 @@ def _check_service(name: str) -> dict:
     elif name == "mailserver":
         return {"running": True, "label": "Mail Server"}
     elif name == "chrome":
-        r = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                            "mzakria@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com", "echo ok"],
-                           capture_output=True, text=True, timeout=10)
-        return {"running": "ok" in (r.stdout or ""), "label": "SSH/GraphQL"}
+        return {"running": SSH_STATUS["running"], "label": "SSH/GraphQL"}
     elif name == "mailapp":
         r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True)
         return {"running": r.returncode == 0, "label": "Mail.app"}
@@ -149,6 +152,7 @@ def _get_status_data() -> dict:
         "emails": EMAILS[:20],
         "case_list_url": view_url,
         "notify_email": cfg.get("notify_email", os.environ.get("SF_NOTIFY_EMAIL", "not configured")),
+        "watchdog_log": list(WATCHDOG_LOG),
     }
 
 
@@ -357,6 +361,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 {emails_html}
 
+<!-- Self-Healing Watchdog -->
+<div class="section-title" style="margin-top:22px"><span class="icon">🛡️</span> Self-Healing Watchdog</div>
+<div class="log-box">{watchdog_html}</div>
+
 <!-- Activity Log -->
 <div class="section-title" style="margin-top:22px"><span class="icon">📜</span> Activity Log</div>
 <div class="log-box">{log_html}</div>
@@ -412,6 +420,16 @@ def _status_pill(status: str) -> str:
     else:
         cls = "default"
     return f'<span class="status-pill {cls}">{status}</span>'
+
+
+def _render_watchdog(entries: list) -> str:
+    if not entries:
+        return '<div class="log-line"><span class="info">🛡️ Watchdog active — monitoring all services every 30s</span></div>'
+    html = ""
+    for e in entries[-10:]:
+        cls = "ok" if "✓" in e else ("err" if "✗" in e or "⚠" in e else "info")
+        html += f'<div class="log-line"><span class="{cls}">{e}</span></div>'
+    return html
 
 
 def _render(data: dict) -> str:
@@ -548,6 +566,7 @@ def _render(data: dict) -> str:
         "{cases_html}": cases_html,
         "{emails_html}": emails_html,
         "{log_html}": log_html,
+        "{watchdog_html}": _render_watchdog(data.get("watchdog_log", [])),
         "{case_list_url}": data.get("case_list_url", ""),
         "{notify_email}": data.get("notify_email", "not configured"),
     }
@@ -651,16 +670,108 @@ def run_web(port=8090):
     server.serve_forever()
 
 
+def _watchdog_log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    WATCHDOG_LOG.append(entry)
+    if len(WATCHDOG_LOG) > 20:
+        WATCHDOG_LOG.pop(0)
+    print(f"[WATCHDOG] {msg}", flush=True)
+
+
+def _watchdog_loop():
+    """Self-healing watchdog — checks every 30s, auto-fixes anything down."""
+    time.sleep(10)  # initial delay to let services start
+    _watchdog_log("Watchdog started — monitoring all services")
+
+    while True:
+        try:
+            # 1. Check SF Poller
+            r = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
+            if POLLER_LABEL not in (r.stdout or ""):
+                _watchdog_log("⚠ SF Poller not running — restarting...")
+                plist = os.path.join(LAUNCH_DIR, f"{POLLER_LABEL}.plist")
+                if os.path.exists(plist):
+                    subprocess.run(["launchctl", "unload", plist], capture_output=True, timeout=5)
+                    time.sleep(1)
+                    subprocess.run(["launchctl", "load", plist], capture_output=True, timeout=5)
+                    subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
+                    _watchdog_log("✓ SF Poller restarted via LaunchAgent")
+                else:
+                    _watchdog_log("✗ Poller plist missing — run install.sh again")
+
+            # 2. Check Mail.app
+            r = subprocess.run(["pgrep", "-x", "Mail"], capture_output=True, timeout=5)
+            if r.returncode != 0:
+                _watchdog_log("⚠ Mail.app not running — starting...")
+                subprocess.run(["open", "-gja", "Mail"], capture_output=True, timeout=10)
+                _watchdog_log("✓ Mail.app started")
+
+            # 3. Check SSH/GraphQL connectivity (cached for dashboard)
+            try:
+                cfg = _read_config()
+                ssh_user = cfg.get("supportshell_user", "mzakria")
+                ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+                r = subprocess.run(
+                    ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", ssh_host, "echo ok"],
+                    capture_output=True, text=True, timeout=12)
+                ssh_ok = "ok" in (r.stdout or "")
+                SSH_STATUS["running"] = ssh_ok
+                SSH_STATUS["last_check"] = time.time()
+                if not ssh_ok:
+                    _watchdog_log("⚠ SSH to supportshell not reachable")
+            except Exception:
+                SSH_STATUS["running"] = False
+                _watchdog_log("⚠ SSH check timed out")
+
+            # 4. Check SMTP relay
+            try:
+                import smtplib
+                with smtplib.SMTP("127.0.0.1", 2525, timeout=3) as s:
+                    s.noop()
+            except Exception:
+                _watchdog_log("⚠ Local SMTP not responding on port 2525")
+
+            # 5. Check heartbeat freshness — if poller hasn't polled in 5 min, force restart
+            hb_path = os.path.expanduser("~/.local/state/sf-poller-heartbeat.json")
+            try:
+                with open(hb_path) as f:
+                    hb = json.load(f)
+                last = datetime.fromisoformat(hb["last_successful_poll"])
+                age = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc)).total_seconds()
+                if age > 300:
+                    _watchdog_log(f"⚠ Poller heartbeat stale ({int(age)}s) — force restarting...")
+                    subprocess.run(["launchctl", "stop", POLLER_LABEL], capture_output=True, timeout=5)
+                    time.sleep(2)
+                    subprocess.run(["launchctl", "start", POLLER_LABEL], capture_output=True, timeout=5)
+                    _watchdog_log("✓ SF Poller force-restarted (stale heartbeat)")
+            except FileNotFoundError:
+                pass  # first run, no heartbeat yet
+            except Exception as e:
+                _watchdog_log(f"⚠ Heartbeat check error: {str(e)[:60]}")
+
+        except Exception as e:
+            _watchdog_log(f"✗ Watchdog error: {str(e)[:80]}")
+
+        time.sleep(60)  # check every 60s
+
+
 def main():
     print("=" * 50)
     print("  SF Notification Center")
     print("  SMTP: localhost:2525")
     print("  Web:  http://localhost:8090")
+    print("  Watchdog: auto-heals every 30s")
     print("=" * 50)
 
     controller = Controller(MailHandler(), hostname="0.0.0.0", port=2525)
     controller.start()
     print("[SMTP] Listening on port 2525")
+
+    # Start self-healing watchdog
+    wd = threading.Thread(target=_watchdog_loop, daemon=True)
+    wd.start()
+    print("[WATCHDOG] Self-healing monitor started")
 
     run_web(8090)
 

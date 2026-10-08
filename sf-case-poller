@@ -1118,21 +1118,37 @@ def poll_once(conn: sqlite3.Connection) -> dict:
     run_start = datetime.now(timezone.utc).isoformat()
     stats = {"cases": 0, "events": 0, "notifications": 0, "status": "OK", "error": ""}
 
-    # 1. Discover cases via GraphQL (no Chrome needed)
+    # 1. Discover cases via GraphQL — auto-retry once on failure
     log_info("POLL_START")
     log_info("case_discovery_started", source="GraphQL_API")
 
-    try:
-        cases = discover_cases_graphql()
-        log_info("graphql_discovery_complete", cases=len(cases))
-    except Exception as exc:
+    cases = []
+    last_err = ""
+    for attempt in range(2):
+        try:
+            cases = discover_cases_graphql()
+            if cases:
+                log_info("graphql_discovery_complete", cases=len(cases), attempt=attempt + 1)
+                break
+            else:
+                last_err = "empty response"
+                if attempt == 0:
+                    log_warn("discovery_empty_retrying", attempt=1)
+                    time.sleep(5)
+        except Exception as exc:
+            last_err = str(exc)[:200]
+            if attempt == 0:
+                log_warn("discovery_failed_retrying", error=last_err, attempt=1)
+                time.sleep(5)
+
+    if not cases and last_err:
         stats["status"] = "DISCOVERY_FAILED"
-        stats["error"] = str(exc)[:200]
-        log_error("discovery_failed", error=stats["error"])
-        _write_heartbeat(0, "DISCOVERY_FAILED", stats["error"])
+        stats["error"] = last_err
+        log_error("discovery_failed", error=last_err, attempts=2)
+        _write_heartbeat(0, "DISCOVERY_FAILED", last_err)
         conn.execute(
             "INSERT INTO poll_runs (started_at, finished_at, status, error) VALUES (?,?,?,?)",
-            (run_start, datetime.now(timezone.utc).isoformat(), "DISCOVERY_FAILED", stats["error"]),
+            (run_start, datetime.now(timezone.utc).isoformat(), "DISCOVERY_FAILED", last_err),
         )
         conn.commit()
         return stats
@@ -1787,13 +1803,34 @@ def main() -> int:
         pass
 
     POLL_INTERVAL = 60  # GraphQL poll every 1 minute (status + comments in one call)
+    consecutive_failures = 0
 
     while True:
         try:
-            poll_once(conn)
+            stats = poll_once(conn)
             process_retry_queue(conn)
+
+            if stats.get("status") == "OK":
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            # Self-healing: if 3 consecutive failures, reset circuit breaker
+            if consecutive_failures >= 3 and ssh_circuit.is_open:
+                log_warn("self_heal_reset_circuit", failures=consecutive_failures)
+                ssh_circuit.failures = 0
+                ssh_circuit.opened_at = 0.0
+
+            # Self-healing: if 5 consecutive failures, re-baseline on next success
+            if consecutive_failures >= 5:
+                log_warn("self_heal_rebaseline", failures=consecutive_failures,
+                         action="will re-baseline on next successful poll")
+                _db_set(conn, "initialized", "0")
+
         except Exception as exc:
-            log_error("poll_error", error=str(exc)[:200])
+            consecutive_failures += 1
+            log_error("poll_error", error=str(exc)[:200], consecutive_failures=consecutive_failures)
+
         time.sleep(POLL_INTERVAL)
 
 

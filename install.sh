@@ -14,8 +14,8 @@ LAUNCH_DIR="$HOME_DIR/Library/LaunchAgents"
 PYTHON="$(command -v python3)"
 USER_NAME="${USER:-mzakria}"
 
-POLLER_LABEL="com.mzakria.sf-case-poller"
-MAILER_LABEL="com.mzakria.local-mailserver"
+POLLER_LABEL="com.${USER_NAME}.sf-case-poller"
+MAILER_LABEL="com.${USER_NAME}.local-mailserver"
 
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; B='\033[1;34m'; N='\033[0m'; BOLD='\033[1m'
 
@@ -45,6 +45,20 @@ if ! command -v ssh &>/dev/null; then
     exit 1
 fi
 ok "SSH available"
+
+# Install aiosmtpd (required for dashboard SMTP server)
+if "$PYTHON" -c "import aiosmtpd" 2>/dev/null; then
+    ok "aiosmtpd already installed"
+else
+    echo "  Installing aiosmtpd..."
+    "$PYTHON" -m pip install --quiet aiosmtpd 2>/dev/null || pip3 install --quiet aiosmtpd 2>/dev/null
+    if "$PYTHON" -c "import aiosmtpd" 2>/dev/null; then
+        ok "aiosmtpd installed"
+    else
+        fail "Could not install aiosmtpd — run: pip3 install aiosmtpd"
+        exit 1
+    fi
+fi
 
 # ────────────────────────────────────────────────────────────────
 step "2/8" "Installing scripts to ~/.local/bin/"
@@ -82,14 +96,8 @@ CFG="$STATE_DIR/sf-poller-config.json"
 if [ -f "$CFG" ]; then
     ok "Config already exists: $CFG"
 else
-    # Ask for email (with sensible default)
-    DEFAULT_EMAIL="${USER_NAME}@redhat.com"
-    read -p "  Notification email [$DEFAULT_EMAIL]: " INPUT_EMAIL
-    EMAIL="${INPUT_EMAIL:-$DEFAULT_EMAIL}"
-
-    # Ask for supportshell user (with sensible default)
-    read -p "  Supportshell username [$USER_NAME]: " INPUT_SSH
-    SSH_USER="${INPUT_SSH:-$USER_NAME}"
+    EMAIL="${USER_NAME}@redhat.com"
+    SSH_USER="$USER_NAME"
 
     cat > "$CFG" <<CFGEOF
 {
@@ -97,7 +105,7 @@ else
   "supportshell_user": "$SSH_USER"
 }
 CFGEOF
-    ok "Config created: $CFG"
+    ok "Config created: $CFG (email: $EMAIL, ssh: $SSH_USER)"
 fi
 
 # Read SSH user from config for later steps
