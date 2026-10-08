@@ -1540,6 +1540,14 @@ def cmd_install():
         print(f"    Fix: ssh-copy-id {ssh_host}")
         print(f"    Then re-run: sf-case-poller install")
 
+    # 6. Open dashboard in browser
+    print("[6/6] Opening dashboard...")
+    try:
+        subprocess.Popen(["open", "http://localhost:8090"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("  Dashboard: http://localhost:8090")
+    except Exception:
+        print("  Dashboard: http://localhost:8090 (open manually)")
+
     print(f"\n{'='*50}")
     print("INSTALLED SUCCESSFULLY!")
     print(f"{'='*50}")
@@ -1587,6 +1595,12 @@ def cmd_restart():
 def cmd_logs():
     os.execvp("tail", ["tail", "-f", os.path.expanduser("~/Library/Logs/sf-case-poller.log")])
 
+def cmd_dashboard():
+    """Open the dashboard in the default browser."""
+    url = "http://localhost:8090"
+    subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"Dashboard opened: {url}")
+
 
 def main() -> int:
     args = sys.argv[1:]
@@ -1611,6 +1625,9 @@ def main() -> int:
     if cmd == "logs":
         cmd_logs()
         return 0
+    if cmd == "dashboard" or cmd == "web" or cmd == "open":
+        cmd_dashboard()
+        return 0
     if cmd in ("help", "--help", "-h", ""):
         print("SF Case Notification Center")
         print("")
@@ -1626,6 +1643,7 @@ def main() -> int:
         print("Monitor:")
         print("  sf-case-poller status      Check status")
         print("  sf-case-poller health      Health check")
+        print("  sf-case-poller dashboard   Open web dashboard in browser")
         print("  sf-case-poller logs        View live logs")
         print("  sf-case-poller history     Notification history")
         print("  sf-case-poller test-email  Test email delivery")
