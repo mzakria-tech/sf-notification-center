@@ -22,7 +22,7 @@ STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
 CONFIG_PATH = os.path.expanduser("~/.local/state/sf-poller-config.json")
 POLLER_LOG = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
 WATCHDOG_LOG = []  # last 20 actions for dashboard display
-POLLER_LABEL = "com.mzakria.sf-case-poller"
+POLLER_LABEL = f"com.{os.environ.get('USER', 'mzakria')}.sf-case-poller"
 LAUNCH_DIR = os.path.expanduser("~/Library/LaunchAgents")
 SSH_STATUS = {"running": True, "label": "SSH/GraphQL", "last_check": 0}  # cached, updated by watchdog
 
@@ -63,7 +63,7 @@ def _check_service(name: str) -> dict:
     """Check if a service is running."""
     if name == "poller":
         r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        running = "com.mzakria.sf-case-poller" in (r.stdout or "")
+        running = POLLER_LABEL in (r.stdout or "")
         return {"running": running, "label": "SF Case Poller"}
     elif name == "mailserver":
         return {"running": True, "label": "Mail Server"}
@@ -633,7 +633,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 # Test SSH and report
                 try:
                     cfg = _read_config()
-                    ssh_user = cfg.get("supportshell_user", "mzakria")
+                    ssh_user = cfg.get("supportshell_user", os.environ.get("USER", "mzakria"))
                     ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
                     r = subprocess.run(
                         ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host, "echo ok"],
@@ -709,7 +709,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 cfg["case_list_url"] = new_url
                 _save_config(cfg)
                 # Restart poller with new URL
-                plist = os.path.expanduser("~/Library/LaunchAgents/com.sf-notify.case-poller.plist")
+                plist = os.path.join(LAUNCH_DIR, f"{POLLER_LABEL}.plist")
                 subprocess.run(["launchctl", "unload", plist], capture_output=True)
                 __import__('time').sleep(1)
                 # Clear state so it re-initialises with new view
