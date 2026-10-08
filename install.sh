@@ -16,7 +16,18 @@ mkdir -p "$BIN_DIR" "$LA_DIR" "$STATE_DIR" "$LOG_DIR"
 
 # Install Python dependency
 echo "→ Installing aiosmtpd..."
-pip3 install aiosmtpd --quiet 2>/dev/null || pip install aiosmtpd --quiet
+if command -v pip3 &>/dev/null; then
+    pip3 install aiosmtpd --quiet
+elif command -v pip &>/dev/null; then
+    pip install aiosmtpd --quiet
+elif command -v python3 &>/dev/null; then
+    python3 -m pip install aiosmtpd --quiet
+elif command -v /opt/homebrew/bin/python3 &>/dev/null; then
+    /opt/homebrew/bin/python3 -m pip install aiosmtpd --quiet
+else
+    echo "❌ No pip/python3 found. Install Python 3 first: brew install python3"
+    exit 1
+fi
 
 # Copy scripts
 echo "→ Installing scripts to $BIN_DIR..."
