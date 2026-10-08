@@ -176,23 +176,81 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────
-step "6/8" "Checking GraphQL token on supportshell"
+step "6/8" "Setting up GraphQL access"
 # ────────────────────────────────────────────────────────────────
 
 if [ "$SSH_OK" -eq 1 ]; then
-    TOKEN_OUT=$(ssh -o ConnectTimeout=10 "$SSH_HOST" \
-        "test -f ~/.cache/hydra-mcp/tokens/redhat-sso-token.json && echo GQL_OK; \
-         test -f ~/.yank/oidc-tokens.json && echo YANK_OK" 2>/dev/null || true)
+    # Actually TEST GraphQL — not just check if token file exists
+    echo -e "  Testing GraphQL API..."
+    GQL_TEST=$(ssh -o ConnectTimeout=15 "$SSH_HOST" 'python3 -c "
+import json, urllib.request, urllib.parse, os
 
-    if echo "$TOKEN_OUT" | grep -q GQL_OK; then
-        ok "GraphQL token found (hydra-mcp)"
-    elif echo "$TOKEN_OUT" | grep -q YANK_OK; then
-        ok "Yank token found (fallback)"
-        warn "For best results, run on supportshell: redhat-hydra-auth --production"
+def try_token(path):
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        d = json.load(f)
+    data = urllib.parse.urlencode({\"grant_type\": \"refresh_token\", \"refresh_token\": d[\"refresh_token\"], \"client_id\": \"cee-supportshell-deviceauth\"}).encode()
+    req = urllib.request.Request(\"https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token\", data)
+    at = json.loads(urllib.request.urlopen(req, timeout=10).read())[\"access_token\"]
+    q = json.dumps({\"query\": \"{ redhat_support_uiapi { query { RedHatSupportCase(first: 1, where: { IsClosed: { eq: false } }) { edges { node { CaseNumber__c { value } } } } } } }\"}).encode()
+    req2 = urllib.request.Request(\"https://vpn.graphql.redhat.com\", data=q)
+    req2.add_header(\"Authorization\", \"Bearer \" + at)
+    req2.add_header(\"Content-Type\", \"application/json\")
+    req2.add_header(\"apollographql-client-name\", \"redhat-hydra-mcp-server\")
+    req2.add_header(\"apollographql-client-version\", \"0.1.0\")
+    resp = urllib.request.urlopen(req2, timeout=15)
+    result = json.loads(resp.read())
+    edges = result.get(\"data\", {}).get(\"redhat_support_uiapi\", {}).get(\"query\", {}).get(\"RedHatSupportCase\", {}).get(\"edges\", [])
+    return len(edges)
+
+# Try hydra-mcp token first, then yank
+for p in [os.path.expanduser(\"~/.cache/hydra-mcp/tokens/redhat-sso-token.json\"), os.path.expanduser(\"~/.yank/oidc-tokens.json\")]:
+    try:
+        n = try_token(p)
+        if n is not None and n > 0:
+            print(\"GQL_OK\")
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+print(\"GQL_FAIL\")
+"' 2>/dev/null || echo "GQL_FAIL")
+
+    if echo "$GQL_TEST" | grep -q GQL_OK; then
+        ok "GraphQL API working — cases accessible"
     else
-        warn "No GraphQL token found on supportshell"
-        echo -e "    ${Y}Run once:  ssh $SSH_HOST${N}"
-        echo -e "    ${Y}Then:      redhat-hydra-auth --production${N}"
+        warn "GraphQL token missing or expired — setting up now..."
+        echo ""
+        echo -e "  ${B}Opening authentication in your browser...${N}"
+        echo -e "  ${Y}Complete the login in the browser window that opens.${N}"
+        echo ""
+        # Run hydra-auth interactively — user sees the device auth URL
+        ssh -t "$SSH_HOST" "redhat-hydra-auth --production" 2>&1 || true
+        echo ""
+
+        # Re-test after auth
+        GQL_RETEST=$(ssh -o ConnectTimeout=15 "$SSH_HOST" 'python3 -c "
+import json, urllib.request, urllib.parse, os
+path = os.path.expanduser(\"~/.cache/hydra-mcp/tokens/redhat-sso-token.json\")
+if not os.path.exists(path):
+    print(\"NO_TOKEN\"); raise SystemExit(1)
+with open(path) as f:
+    d = json.load(f)
+data = urllib.parse.urlencode({\"grant_type\": \"refresh_token\", \"refresh_token\": d[\"refresh_token\"], \"client_id\": \"cee-supportshell-deviceauth\"}).encode()
+req = urllib.request.Request(\"https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token\", data)
+at = json.loads(urllib.request.urlopen(req, timeout=10).read())[\"access_token\"]
+print(\"GQL_OK\")
+"' 2>/dev/null || echo "GQL_FAIL")
+
+        if echo "$GQL_RETEST" | grep -q GQL_OK; then
+            ok "GraphQL token created — API working"
+        else
+            warn "GraphQL setup incomplete — poller will retry automatically"
+            echo -e "    ${Y}You can manually run: ssh $SSH_HOST${N}"
+            echo -e "    ${Y}Then: redhat-hydra-auth --production${N}"
+        fi
     fi
 else
     warn "Skipped — SSH not working"
