@@ -1006,13 +1006,19 @@ except Exception as e:
 
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags and decode entities from comment body."""
-    import re, html
+    """Remove HTML tags and decode entities from comment body.
+    GraphQL returns double-encoded HTML (&lt;p&gt;), so decode entities first."""
+    import re, html as html_mod
+    # Step 1: decode HTML entities first (&lt;p&gt; → <p>)
+    text = html_mod.unescape(text)
+    # Step 2: decode again in case of double-encoding (&amp;lt; → &lt; → <)
+    text = html_mod.unescape(text)
+    # Step 3: convert <br> and </p> to newlines
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+    # Step 4: strip all remaining HTML tags
     text = re.sub(r'<[^>]+>', '', text)
-    text = html.unescape(text)
-    # Collapse multiple blank lines
+    # Step 5: collapse multiple blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
