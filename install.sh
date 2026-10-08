@@ -249,11 +249,18 @@ done
 open "http://localhost:8090" 2>/dev/null || true
 ok "Dashboard opened at http://localhost:8090"
 
-# Run first poll in background so install finishes fast
+# Run first poll now — takes ~10s
 echo ""
-echo -e "  ${Y}Running first poll in background...${N}"
-nohup python3 "$BIN_DIR/sf-case-poller" --once > /dev/null 2>&1 &
-ok "First poll running — cases will appear on dashboard within ~15s"
+echo -e "  ${Y}Running first poll...${N}"
+python3 "$BIN_DIR/sf-case-poller" --once > /dev/null 2>&1
+CASES=$(python3 -c "
+import sqlite3
+try:
+    c = sqlite3.connect('$STATE_DIR/sf-notification-center.db')
+    print(c.execute('SELECT COUNT(*) FROM cases').fetchone()[0])
+except: print(0)
+" 2>/dev/null || echo "0")
+ok "First poll complete — $CASES cases tracked"
 
 echo ""
 echo -e "${G}╔═══════════════════════════════════════════════════════╗${N}"
