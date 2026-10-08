@@ -22,9 +22,18 @@ echo -e "${R}╚═════════════════════�
 echo -e "\n${B}[1/4]${N} ${BOLD}Stopping services${N}"
 launchctl stop "$POLLER_LABEL" 2>/dev/null
 launchctl unload "$LAUNCH_DIR/$POLLER_LABEL.plist" 2>/dev/null
+echo -e "  ${G}✓${N} SF Poller stopped"
+
 launchctl stop "$MAILER_LABEL" 2>/dev/null
 launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null
+echo -e "  ${G}✓${N} Mail Server LaunchAgent stopped"
+
 pkill -f "local-mailserver" 2>/dev/null
+echo -e "  ${G}✓${N} Mail Server process killed"
+
+pkill -f "sf-case-poller" 2>/dev/null
+echo -e "  ${G}✓${N} Poller process killed"
+
 echo -e "  ${G}✓${N} All services stopped"
 
 echo -e "\n${B}[2/4]${N} ${BOLD}Removing LaunchAgents${N}"
