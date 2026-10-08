@@ -1357,6 +1357,12 @@ def _write_json_compat(conn: sqlite3.Connection, columns: list[str]):
             fields = json.loads(r["fields_json"] or "{}")
         except Exception:
             pass
+        # Populate fields with standard columns for dashboard rendering
+        fields["CaseNumber"] = r["case_number"]
+        fields["Status"] = r["status"]
+        fields["Subject"] = r["subject"]
+        fields["LastModified"] = (r["last_modified"] or "")[:19]
+        fields["Owner"] = r["owner_alias"] or ""
         cases_map[r["case_id"]] = {
             "status": r["status"],
             "number": r["case_number"],

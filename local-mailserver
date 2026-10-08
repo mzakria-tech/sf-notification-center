@@ -475,7 +475,7 @@ def _render(data: dict) -> str:
                 for col in display_cols:
                     val = fields.get(col, "")
                     col_lower = col.lower()
-                    if "case number" in col_lower:
+                    if "case" in col_lower and "number" in col_lower or col_lower == "casenumber":
                         cells += f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{val}</span></a></td>'
                     elif col_lower == "status":
                         cells += f"<td>{_status_pill(val)}</td>"
