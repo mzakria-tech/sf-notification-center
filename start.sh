@@ -18,17 +18,20 @@ if ! pgrep -x "Google Chrome" > /dev/null; then
     sleep 3
 fi
 
+POLLER_LABEL="com.${USER}.sf-case-poller"
+MAILER_LABEL="com.${USER}.local-mailserver"
+
 # Start mail server (dashboard + SMTP)
-launchctl unload ~/Library/LaunchAgents/com.sf-notify.mailserver.plist 2>/dev/null || true
+launchctl unload ~/Library/LaunchAgents/${MAILER_LABEL}.plist 2>/dev/null || true
 sleep 1
-launchctl load ~/Library/LaunchAgents/com.sf-notify.mailserver.plist
+launchctl load ~/Library/LaunchAgents/${MAILER_LABEL}.plist
 echo "→ Mail Server + Dashboard started (port 8090)"
 
 # Start poller
-launchctl unload ~/Library/LaunchAgents/com.sf-notify.case-poller.plist 2>/dev/null || true
+launchctl unload ~/Library/LaunchAgents/${POLLER_LABEL}.plist 2>/dev/null || true
 sleep 1
-launchctl load ~/Library/LaunchAgents/com.sf-notify.case-poller.plist
-echo "→ SF Case Poller started (every 5 min)"
+launchctl load ~/Library/LaunchAgents/${POLLER_LABEL}.plist
+echo "→ SF Case Poller started (every 1 min)"
 
 echo ""
 echo "╔═══════════════════════════════════════════════╗"

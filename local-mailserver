@@ -314,11 +314,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
 </div>
 
-<!-- Fix All Button -->
-<div style="text-align:center;margin-bottom:16px">
-  <button class="start-btn" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:8px 24px;font-size:13px;border-radius:8px" onclick="startService('fix_all', this)">🔧 Fix All Services</button>
-</div>
-
 <!-- Stats -->
 <div class="stats">
   <div class="stat">
@@ -375,6 +370,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="log-box">{log_html}</div>
 
 </div>
+<!-- Fix All Button -->
+<div style="text-align:center;margin:22px 0 10px">
+  <button class="start-btn" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:10px 32px;font-size:14px;border-radius:8px;width:100%" onclick="startService('fix_all', this)">🔧 Fix All Services</button>
+</div>
+
 <div class="footer">SF Notification Center &bull; Red Hat Support</div>
 <script>
 

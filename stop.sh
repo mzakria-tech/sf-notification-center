@@ -3,8 +3,11 @@
 
 echo "Stopping SF Notification Center..."
 
-launchctl unload ~/Library/LaunchAgents/com.sf-notify.case-poller.plist 2>/dev/null && echo "→ SF Case Poller stopped" || echo "→ SF Case Poller was not running"
-launchctl unload ~/Library/LaunchAgents/com.sf-notify.mailserver.plist 2>/dev/null && echo "→ Mail Server + Dashboard stopped" || echo "→ Mail Server was not running"
+POLLER_LABEL="com.${USER}.sf-case-poller"
+MAILER_LABEL="com.${USER}.local-mailserver"
+
+launchctl unload ~/Library/LaunchAgents/${POLLER_LABEL}.plist 2>/dev/null && echo "→ SF Case Poller stopped" || echo "→ SF Case Poller was not running"
+launchctl unload ~/Library/LaunchAgents/${MAILER_LABEL}.plist 2>/dev/null && echo "→ Mail Server + Dashboard stopped" || echo "→ Mail Server was not running"
 
 echo ""
 echo "All services stopped."
