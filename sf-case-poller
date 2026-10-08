@@ -397,62 +397,89 @@ def scrape_cases():
     return cases, columns
 
 
-def _scrape_case_comments(case_id: str) -> list[dict]:
-    """Navigate Chrome to the case detail page and extract recent comments from DOM."""
+def _fetch_comments_temp_tab(case_id: str) -> list[dict]:
+    """Open a temporary Chrome tab, scrape case comments, then close the tab."""
+    import base64
+    import tempfile
+
     case_url = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{case_id}/view"
-    js = """
+    comment_js = """
     (function() {
         var comments = [];
-        // Look for feed items / case comments in the Lightning page
-        var feedItems = document.querySelectorAll(
-            '.cuf-feedItem, .feedItemBody, [data-aura-class*="feed"], .slds-feed__item, .forceChatterFeedBody'
-        );
+        // Try multiple selectors for case comments/feed
+        var selectors = [
+            '.cuf-feedItem', '.feedItemBody', '[data-aura-class*="feed"]',
+            '.slds-feed__item', '.forceChatterFeedBody',
+            '.caseCommentList li', '.caseComment',
+            '[class*="comment"]', '[class*="Comment"]',
+            '.slds-post', '.feedElement'
+        ];
+        var feedItems = [];
+        for (var s = 0; s < selectors.length; s++) {
+            var items = document.querySelectorAll(selectors[s]);
+            if (items.length > 0) { feedItems = items; break; }
+        }
         for (var i = 0; i < feedItems.length && i < 5; i++) {
             var item = feedItems[i];
-            var bodyEl = item.querySelector('.feedItemText, .cuf-feedBodyText, .slds-post__content, p, .messageBody');
-            var authorEl = item.querySelector('.feedItemAuthor, .cuf-feedItemAuthor, .slds-publisher__toggle-visibility, a[data-aura-class*="user"]');
-            var dateEl = item.querySelector('.feedItemTimestamp, .cuf-feedItemTimestamp, time, .timeStamp');
+            var bodyEl = item.querySelector('.feedItemText, .cuf-feedBodyText, .slds-post__content, p, .messageBody, .forceChatterMessageBodyRenderer');
+            var authorEl = item.querySelector('.feedItemAuthor, .cuf-feedItemAuthor, a[data-aura-class*="user"], .actor .name, a.slds-truncate');
+            var dateEl = item.querySelector('.feedItemTimestamp, .cuf-feedItemTimestamp, time, .timeStamp, .uiOutputDateTime');
             var body = bodyEl ? bodyEl.textContent.trim() : item.textContent.trim().substring(0, 500);
             var author = authorEl ? authorEl.textContent.trim() : '';
             var date = dateEl ? (dateEl.getAttribute('datetime') || dateEl.textContent.trim()) : '';
             if (body && body.length > 5) {
-                comments.push({
-                    body: body.substring(0, 500),
-                    author: author,
-                    date: date,
-                    isPublic: true
-                });
+                comments.push({body: body.substring(0, 500), author: author, date: date});
             }
         }
-
-        // Also try generic text blocks that look like comments
+        // Fallback: any related list with "comment" in header
         if (comments.length === 0) {
-            var panels = document.querySelectorAll('.slds-card, .forceRelatedListSingleContainer');
+            var panels = document.querySelectorAll('.slds-card, .forceRelatedListSingleContainer, [class*="relatedList"]');
             for (var p = 0; p < panels.length; p++) {
-                var header = panels[p].querySelector('h2, .slds-card__header-title');
+                var header = panels[p].querySelector('h2, .slds-card__header-title, span[title]');
                 if (header && /comment/i.test(header.textContent)) {
-                    var items = panels[p].querySelectorAll('li, tr, .slds-item');
-                    for (var j = 0; j < items.length && j < 5; j++) {
-                        comments.push({
-                            body: items[j].textContent.trim().substring(0, 500),
-                            author: '',
-                            date: '',
-                            isPublic: true
-                        });
+                    var rows = panels[p].querySelectorAll('li, tr, .slds-item, [class*="row"]');
+                    for (var j = 0; j < rows.length && j < 5; j++) {
+                        var txt = rows[j].textContent.trim();
+                        if (txt.length > 5) comments.push({body: txt.substring(0, 500), author: '', date: ''});
                     }
                 }
             }
         }
-
         return JSON.stringify(comments);
     })()
     """
-    result = chrome_js(js, url=case_url)
-    if not result or result.startswith("ERROR:"):
+    b64 = base64.b64encode(comment_js.encode("utf-8")).decode("ascii")
+    exec_line = f'execute javascript "eval(atob(\'{b64}\'))"'
+
+    ascript = f'''
+tell application "Google Chrome"
+    -- Open a new temporary tab
+    tell window 1
+        set tempTab to make new tab with properties {{URL:"{case_url}"}}
+    end tell
+    delay 10
+    -- Scrape comments
+    tell tempTab
+        set r to {exec_line}
+    end tell
+    -- Close the temp tab
+    close tempTab
+    return r
+end tell
+'''
+    fd, path = tempfile.mkstemp(suffix=".applescript")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(ascript)
+        r = subprocess.run(["osascript", path], capture_output=True, text=True, timeout=30)
+    finally:
+        os.unlink(path)
+
+    if r.returncode != 0:
         return []
     try:
-        return json.loads(result)[:5]
-    except json.JSONDecodeError:
+        return json.loads((r.stdout or "").strip())[:5]
+    except (json.JSONDecodeError, ValueError):
         return []
 
 
@@ -462,13 +489,12 @@ def _format_comments(comments: list[dict]) -> str:
         return ""
     lines = ["\n--- Recent Comments ---"]
     for c in comments:
-        author = c.get("author", "Unknown")
+        author = c.get("author", "").strip() or "Unknown"
         date = (c.get("date") or "")[:16].replace("T", " ")
-        pub = "Public" if c.get("isPublic") else "Private"
         body = (c.get("body") or "").strip()
         if body:
-            lines.append(f"\n[{pub}] {author} ({date}):")
-            lines.append(body[:300])
+            lines.append(f"\n{author} ({date}):")
+            lines.append(body[:400])
     return "\n".join(lines)
 
 
@@ -516,6 +542,17 @@ def poll_once() -> int:
 
         # Check for status change
         if old_status is not None and old_status.strip().lower() != status.strip().lower():
+            # Fetch recent comments from case detail page
+            fetched_comments = []
+            if cid:
+                try:
+                    log(f"fetching comments for {num} (status changed)...")
+                    fetched_comments = _fetch_comments_temp_tab(cid)
+                    log(f"got {len(fetched_comments)} comments for {num}")
+                except Exception as exc:
+                    log(f"comment fetch failed for {num}: {exc}")
+            comment_text = _format_comments(fetched_comments)
+
             title = f"Case {num}: {old_status} → {status}"
             body = (
                 f"Salesforce case {num} status changed.\n"
@@ -529,25 +566,6 @@ def poll_once() -> int:
             try:
                 send_mail(title, body)
                 log(f"emailed {num} (status change)")
-            except Exception as exc:
-                log(f"mail failed {num}: {exc}")
-            sent += 1
-
-        # Check for new comment (different latest comment date)
-        elif old_comment_date and latest_comment and latest_comment != old_comment_date:
-            title = f"Case {num}: New comment"
-            author = comments[0].get("author", "Someone") if comments else "Someone"
-            body = (
-                f"New comment on case {num}.\n"
-                f"Status: {status}\n"
-                f"Subject: {subj}\n"
-                f"{link}\n"
-                f"{comment_text}\n"
-            )
-            notify_banner("Salesforce", f"{num}: New comment by {author}")
-            try:
-                send_mail(title, body)
-                log(f"emailed {num} (new comment)")
             except Exception as exc:
                 log(f"mail failed {num}: {exc}")
             sent += 1
