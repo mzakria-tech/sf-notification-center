@@ -57,21 +57,26 @@ else
     brew install --cask google-chrome
 fi
 
-# ── 6. macOS Mail.app ────────────────────────────────
+# ── 6. Enable Chrome JavaScript from Apple Events ────
+echo "→ Enabling Chrome JavaScript from Apple Events..."
+defaults write com.google.Chrome AllowJavaScriptAppleEvents -bool true
+echo "✓ Chrome AppleScript access enabled"
+
+# ── 7. macOS Mail.app ────────────────────────────────
 if [ -d "/System/Applications/Mail.app" ] || [ -d "/Applications/Mail.app" ]; then
     echo "✓ Mail.app found"
 else
     echo "⚠ Mail.app not found (comes built-in with macOS)"
 fi
 
-# ── 7. Copy scripts ─────────────────────────────────
+# ── 8. Copy scripts ─────────────────────────────────
 echo "→ Installing scripts to $BIN_DIR..."
 cp sf-case-poller "$BIN_DIR/sf-case-poller"
 cp local-mailserver "$BIN_DIR/local-mailserver"
 chmod +x "$BIN_DIR/sf-case-poller" "$BIN_DIR/local-mailserver"
 echo "  Using Python: $PYTHON"
 
-# ── 8. LaunchAgent plists ────────────────────────────
+# ── 9. LaunchAgent plists ────────────────────────────
 echo "→ Installing LaunchAgents..."
 
 cat > "$LA_DIR/com.mzakria.local-mailserver.plist" <<PLIST
@@ -135,7 +140,7 @@ echo "║   ✅ Installation complete!                   ║"
 echo "╚═══════════════════════════════════════════════╝"
 echo ""
 
-# ── 9. Start all services ────────────────────────────
+# ── 10. Start all services ───────────────────────────
 echo "→ Starting all services..."
 
 # Start Mail.app if not running
@@ -173,10 +178,9 @@ echo "  Dashboard:  http://localhost:8090"
 echo "  → Open the dashboard and paste your Salesforce"
 echo "    case list view URL to start monitoring."
 echo ""
-echo "  Make sure:"
-echo "    1. Chrome → View → Developer → Allow JavaScript from Apple Events ✓"
-echo "    2. Chrome is logged into Salesforce"
-echo "    3. Mail.app is configured with your email"
+  echo "  Make sure:"
+echo "    1. Chrome is logged into Salesforce"
+echo "    2. Mail.app is configured with your email"
 echo ""
 echo "  Other commands:"
 echo "    ./stop.sh           — Stop all services"
