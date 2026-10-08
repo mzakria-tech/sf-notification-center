@@ -71,7 +71,7 @@ Set `SF_POLL_INTERVAL` in the LaunchAgent plist (default: 300 seconds = 5 min).
 
 ### Change notification email
 
-Set `SF_NOTIFY_EMAIL` in the LaunchAgent plist (default: `mzakria@redhat.com`).
+Set during `./install.sh` or edit `~/.local/state/sf-poller-config.json`.
 
 ## Architecture
 
@@ -92,8 +92,8 @@ Chrome (Salesforce)  →  AppleScript JS  →  sf-case-poller  →  Mail.app (em
 | Case state | `~/.local/state/sf-case-status.json` |
 | Config | `~/.local/state/sf-poller-config.json` |
 | Poller log | `~/Library/Logs/sf-case-poller.log` |
-| LaunchAgents | `~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist` |
+| LaunchAgents | `~/Library/LaunchAgents/com.sf-notify.case-poller.plist` |
 
 ## Author
 
-Mahammad Zakria — Red Hat OpenShift Support
+Red Hat OpenShift Support

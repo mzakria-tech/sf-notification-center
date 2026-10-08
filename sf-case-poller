@@ -22,7 +22,17 @@ from email.mime.text import MIMEText
 INTERVAL = int(os.environ.get("SF_POLL_INTERVAL", "300"))  # 5 min default
 STATE_PATH = os.path.expanduser("~/.local/state/sf-case-status.json")
 LOG_PATH = os.path.expanduser("~/Library/Logs/sf-case-poller.log")
-TO_ADDR = os.environ.get("SF_NOTIFY_EMAIL", "mzakria@redhat.com")
+def _get_notify_email() -> str:
+    env = os.environ.get("SF_NOTIFY_EMAIL")
+    if env:
+        return env
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f).get("notify_email", "")
+    except Exception:
+        return ""
+
+TO_ADDR = _get_notify_email()
 CONFIG_PATH = os.path.expanduser("~/.local/state/sf-poller-config.json")
 
 def _get_case_list_url() -> str:
@@ -35,7 +45,7 @@ def _get_case_list_url() -> str:
             return json.load(f).get("case_list_url", "")
     except Exception:
         pass
-    return "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1"
+    return ""
 
 CASE_LIST_URL = _get_case_list_url()
 
@@ -133,11 +143,9 @@ tell application "Google Chrome"
         end tell
         delay 15
     else
-        set curURL to URL of sfTab
-        if curURL does not contain "Case/list" then
-            set URL of sfTab to "{url}"
-            delay 12
-        end if
+        -- Always navigate to the configured view URL
+        set URL of sfTab to "{url}"
+        delay 10
     end if
     -- Briefly activate SF tab so Chrome renders all virtual rows
     set origIdx to active tab index of sfWin
@@ -192,8 +200,10 @@ end tell
     return (r.stdout or "").strip()
 
 
-def scrape_cases() -> list[dict]:
+def scrape_cases():
     """Navigate Chrome to the case list, extract cases + recent comments via JS."""
+    if not CASE_LIST_URL:
+        raise RuntimeError("No case list URL configured — set it in the dashboard at http://localhost:8090")
     js = """
     (function() {
         // Get expected row count from the header (e.g. "18 items")

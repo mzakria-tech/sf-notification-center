@@ -19,15 +19,15 @@ if ! pgrep -x "Google Chrome" > /dev/null; then
 fi
 
 # Start mail server (dashboard + SMTP)
-launchctl unload ~/Library/LaunchAgents/com.mzakria.local-mailserver.plist 2>/dev/null || true
+launchctl unload ~/Library/LaunchAgents/com.sf-notify.mailserver.plist 2>/dev/null || true
 sleep 1
-launchctl load ~/Library/LaunchAgents/com.mzakria.local-mailserver.plist
+launchctl load ~/Library/LaunchAgents/com.sf-notify.mailserver.plist
 echo "→ Mail Server + Dashboard started (port 8090)"
 
 # Start poller
-launchctl unload ~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist 2>/dev/null || true
+launchctl unload ~/Library/LaunchAgents/com.sf-notify.case-poller.plist 2>/dev/null || true
 sleep 1
-launchctl load ~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist
+launchctl load ~/Library/LaunchAgents/com.sf-notify.case-poller.plist
 echo "→ SF Case Poller started (every 5 min)"
 
 echo ""

@@ -57,7 +57,7 @@ def _check_service(name: str) -> dict:
     """Check if a service is running."""
     if name == "poller":
         r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        running = "com.mzakria.sf-case-poller" in (r.stdout or "")
+        running = "com.sf-notify.case-poller" in (r.stdout or "")
         return {"running": running, "label": "SF Case Poller"}
     elif name == "mailserver":
         return {"running": True, "label": "Mail Server"}
@@ -129,7 +129,7 @@ def _get_status_data() -> dict:
             break
 
     cfg = _read_config()
-    view_url = cfg.get("case_list_url", "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_cases_Zakria1")
+    view_url = cfg.get("case_list_url", "")
 
     return {
         "poller": poller,
@@ -146,6 +146,7 @@ def _get_status_data() -> dict:
         "logs": logs,
         "emails": EMAILS[:20],
         "case_list_url": view_url,
+        "notify_email": cfg.get("notify_email", os.environ.get("SF_NOTIFY_EMAIL", "not configured")),
     }
 
 
@@ -277,7 +278,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <div class="logo">SF</div>
   <h1>Notification Center</h1>
 </div>
-<div class="subtitle">My Cases (owned by Zakria) &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
+<div class="subtitle">Salesforce case status alerts &bull; Polls every 5 min via Chrome &bull; Auto-refreshes 15s</div>
 
 <!-- Monitor Settings — top of page -->
 <div class="section-title"><span class="icon">🎯</span> Case View to Monitor</div>
@@ -338,7 +339,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
   <div class="stat">
     <div class="stat-label">Sends To</div>
-    <div class="stat-val orange" style="font-size:13px">mzakria@redhat.com</div>
+    <div class="stat-val orange" style="font-size:13px">{notify_email}</div>
     <div class="stat-sub">via Mail.app + local SMTP</div>
   </div>
 </div>
@@ -371,7 +372,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="log-box">{log_html}</div>
 
 </div>
-<div class="footer">SF Notification Center &bull; Mahammad Zakria &bull; Red Hat OpenShift Support</div>
+<div class="footer">SF Notification Center &bull; Red Hat Support</div>
 <script>
 function saveConfig() {
     var btn = document.getElementById('saveBtn');
@@ -587,6 +588,7 @@ def _render(data: dict) -> str:
         "{emails_html}": emails_html,
         "{log_html}": log_html,
         "{case_list_url}": data.get("case_list_url", ""),
+        "{notify_email}": data.get("notify_email", "not configured"),
     }
     for k, v in replacements.items():
         html = html.replace(k, v)
@@ -606,7 +608,7 @@ class WebHandler(BaseHTTPRequestHandler):
             svc = req.get("service", "")
             result = {"ok": False, "msg": "unknown service"}
             if svc == "poller":
-                r = subprocess.run(["launchctl", "load", os.path.expanduser("~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist")], capture_output=True, text=True)
+                r = subprocess.run(["launchctl", "load", os.path.expanduser("~/Library/LaunchAgents/com.sf-notify.case-poller.plist")], capture_output=True, text=True)
                 result = {"ok": r.returncode == 0, "msg": (r.stderr or r.stdout or "started").strip()}
             elif svc == "chrome":
                 r = subprocess.run(["open", "-a", "Google Chrome"], capture_output=True, text=True)
@@ -635,7 +637,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 cfg["case_list_url"] = new_url
                 _save_config(cfg)
                 # Restart poller with new URL
-                plist = os.path.expanduser("~/Library/LaunchAgents/com.mzakria.sf-case-poller.plist")
+                plist = os.path.expanduser("~/Library/LaunchAgents/com.sf-notify.case-poller.plist")
                 subprocess.run(["launchctl", "unload", plist], capture_output=True)
                 import time; time.sleep(1)
                 # Clear state so it re-initialises with new view

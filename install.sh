@@ -69,7 +69,22 @@ else
     echo "⚠ Mail.app not found (comes built-in with macOS)"
 fi
 
-# ── 8. Copy scripts ─────────────────────────────────
+# ── 8. Get user email ────────────────────────────────
+if [ -z "$SF_NOTIFY_EMAIL" ]; then
+    echo ""
+    read -p "→ Enter your email for notifications: " SF_NOTIFY_EMAIL
+    if [ -z "$SF_NOTIFY_EMAIL" ]; then
+        echo "⚠ No email provided. You can set SF_NOTIFY_EMAIL later."
+        SF_NOTIFY_EMAIL="not-configured"
+    fi
+fi
+echo "✓ Notifications will be sent to: $SF_NOTIFY_EMAIL"
+
+# Save to config
+mkdir -p "$STATE_DIR"
+echo "{\"notify_email\": \"$SF_NOTIFY_EMAIL\"}" > "$STATE_DIR/sf-poller-config.json"
+
+# ── 9. Copy scripts ─────────────────────────────────
 echo "→ Installing scripts to $BIN_DIR..."
 cp sf-case-poller "$BIN_DIR/sf-case-poller"
 cp local-mailserver "$BIN_DIR/local-mailserver"
@@ -79,13 +94,13 @@ echo "  Using Python: $PYTHON"
 # ── 9. LaunchAgent plists ────────────────────────────
 echo "→ Installing LaunchAgents..."
 
-cat > "$LA_DIR/com.mzakria.local-mailserver.plist" <<PLIST
+cat > "$LA_DIR/com.sf-notify.mailserver.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.mzakria.local-mailserver</string>
+    <string>com.sf-notify.mailserver</string>
     <key>ProgramArguments</key>
     <array>
         <string>$PYTHON</string>
@@ -103,13 +118,13 @@ cat > "$LA_DIR/com.mzakria.local-mailserver.plist" <<PLIST
 </plist>
 PLIST
 
-cat > "$LA_DIR/com.mzakria.sf-case-poller.plist" <<PLIST
+cat > "$LA_DIR/com.sf-notify.case-poller.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.mzakria.sf-case-poller</string>
+    <string>com.sf-notify.case-poller</string>
     <key>ProgramArguments</key>
     <array>
         <string>$PYTHON</string>
@@ -128,7 +143,7 @@ cat > "$LA_DIR/com.mzakria.sf-case-poller.plist" <<PLIST
         <key>SF_POLL_INTERVAL</key>
         <string>300</string>
         <key>SF_NOTIFY_EMAIL</key>
-        <string>mzakria@redhat.com</string>
+        <string>$SF_NOTIFY_EMAIL</string>
     </dict>
 </dict>
 </plist>
@@ -158,15 +173,15 @@ if ! pgrep -x "Google Chrome" > /dev/null; then
 fi
 
 # Start mail server (dashboard + SMTP)
-launchctl unload "$LA_DIR/com.mzakria.local-mailserver.plist" 2>/dev/null || true
+launchctl unload "$LA_DIR/com.sf-notify.mailserver.plist" 2>/dev/null || true
 sleep 1
-launchctl load "$LA_DIR/com.mzakria.local-mailserver.plist"
+launchctl load "$LA_DIR/com.sf-notify.mailserver.plist"
 echo "  ✓ Mail Server + Dashboard started (port 8090)"
 
 # Start poller
-launchctl unload "$LA_DIR/com.mzakria.sf-case-poller.plist" 2>/dev/null || true
+launchctl unload "$LA_DIR/com.sf-notify.case-poller.plist" 2>/dev/null || true
 sleep 1
-launchctl load "$LA_DIR/com.mzakria.sf-case-poller.plist"
+launchctl load "$LA_DIR/com.sf-notify.case-poller.plist"
 echo "  ✓ SF Case Poller started (every 5 min)"
 
 echo ""
