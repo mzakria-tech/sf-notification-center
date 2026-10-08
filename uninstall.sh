@@ -1,22 +1,12 @@
 #!/bin/bash
-# Uninstall SF Notification Center
+# SF Case Notification Center - Uninstaller
+set -e
+USER_NAME=$(whoami)
+USER_HOME=$(eval echo ~$USER_NAME)
 
-echo "Uninstalling SF Notification Center..."
-
-# Stop services
-launchctl unload ~/Library/LaunchAgents/com.sf-notify.case-poller.plist 2>/dev/null
-launchctl unload ~/Library/LaunchAgents/com.sf-notify.mailserver.plist 2>/dev/null
-
-# Remove LaunchAgents
-rm -f ~/Library/LaunchAgents/com.sf-notify.case-poller.plist
-rm -f ~/Library/LaunchAgents/com.sf-notify.mailserver.plist
-
-# Remove scripts
-rm -f ~/.local/bin/sf-case-poller
-rm -f ~/.local/bin/local-mailserver
-
-# Remove state & config
-rm -f ~/.local/state/sf-case-status.json
-rm -f ~/.local/state/sf-poller-config.json
-
-echo "Uninstalled. Logs left at ~/Library/Logs/ for reference."
+echo "=== Uninstalling SF Case Notification Center ==="
+launchctl stop "com.${USER_NAME}.sf-case-poller" 2>/dev/null || true
+launchctl unload "$USER_HOME/Library/LaunchAgents/com.${USER_NAME}.sf-case-poller.plist" 2>/dev/null || true
+rm -f "$USER_HOME/Library/LaunchAgents/com.${USER_NAME}.sf-case-poller.plist"
+rm -f "$USER_HOME/.local/bin/sf-case-poller"
+echo "Done. Config and DB preserved in ~/.local/state/"

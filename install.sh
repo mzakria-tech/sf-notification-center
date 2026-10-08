@@ -1,228 +1,107 @@
 #!/bin/bash
-# SF Notification Center — Installer
-# Salesforce case status monitor with email alerts & web dashboard
+# SF Case Notification Center - One-click installer
+# Run: curl -sL <repo>/install.sh | bash
+# Or:  ./install.sh
+
 set -e
+echo "=== SF Case Notification Center - Installer ==="
 
-echo "╔═══════════════════════════════════════════════╗"
-echo "║   SF Notification Center — Installer          ║"
-echo "╚═══════════════════════════════════════════════╝"
-echo ""
+# Detect username
+USER_NAME=$(whoami)
+USER_HOME=$(eval echo ~$USER_NAME)
+SUPPORTSHELL_USER="${SUPPORTSHELL_USER:-$USER_NAME}"
 
-BIN_DIR="$HOME/.local/bin"
-LA_DIR="$HOME/Library/LaunchAgents"
-STATE_DIR="$HOME/.local/state"
-LOG_DIR="$HOME/Library/Logs"
+# 1. Install poller script
+echo "[1/4] Installing poller..."
+mkdir -p "$USER_HOME/.local/bin"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cp "$SCRIPT_DIR/sf-case-poller" "$USER_HOME/.local/bin/sf-case-poller"
+chmod +x "$USER_HOME/.local/bin/sf-case-poller"
 
-mkdir -p "$BIN_DIR" "$LA_DIR" "$STATE_DIR" "$LOG_DIR"
+# Add to PATH if needed
+if ! echo "$PATH" | grep -q "$USER_HOME/.local/bin"; then
+    for rc in "$USER_HOME/.zshrc" "$USER_HOME/.bashrc"; do
+        if [ -f "$rc" ]; then
+            grep -q '.local/bin' "$rc" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+        fi
+    done
+    export PATH="$USER_HOME/.local/bin:$PATH"
+fi
 
-# ── 1. Homebrew ──────────────────────────────────────
-if ! command -v brew &>/dev/null; then
-    echo "→ Homebrew not found. Installing..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
+# 2. Create config
+echo "[2/4] Creating config..."
+mkdir -p "$USER_HOME/.local/state"
+if [ ! -f "$USER_HOME/.local/state/sf-poller-config.json" ]; then
+    cat > "$USER_HOME/.local/state/sf-poller-config.json" << EOF
+{
+  "case_list_url": "https://redhatsupport.lightning.force.com/lightning/o/Case/list?filterName=My_ca",
+  "notify_email": "${SUPPORTSHELL_USER}@redhat.com",
+  "supportshell_user": "${SUPPORTSHELL_USER}"
+}
+EOF
+    echo "  Config: $USER_HOME/.local/state/sf-poller-config.json"
 else
-    echo "✓ Homebrew found"
+    echo "  Config already exists, skipping"
 fi
 
-# ── 2. Python 3 ─────────────────────────────────────
-if ! command -v python3 &>/dev/null && ! command -v /opt/homebrew/bin/python3 &>/dev/null; then
-    echo "→ Python 3 not found. Installing..."
-    brew install python3
-else
-    echo "✓ Python 3 found ($(python3 --version 2>/dev/null || /opt/homebrew/bin/python3 --version))"
-fi
-
-PYTHON=$(command -v python3 2>/dev/null || echo "/opt/homebrew/bin/python3")
-
-# ── 3. pip (ensure available) ────────────────────────
-if ! "$PYTHON" -m pip --version &>/dev/null; then
-    echo "→ pip not found. Installing..."
-    "$PYTHON" -m ensurepip --upgrade 2>/dev/null || brew install python3
-else
-    echo "✓ pip found"
-fi
-
-# ── 4. Python dependencies ───────────────────────────
-echo "→ Installing Python packages..."
-"$PYTHON" -m pip install aiosmtpd --quiet --break-system-packages 2>/dev/null \
-    || "$PYTHON" -m pip install aiosmtpd --quiet 2>/dev/null \
-    || pip3 install aiosmtpd --quiet
-echo "✓ aiosmtpd installed"
-
-# ── 5. Google Chrome ─────────────────────────────────
-if [ -d "/Applications/Google Chrome.app" ]; then
-    echo "✓ Google Chrome found"
-else
-    echo "→ Google Chrome not found. Installing via Homebrew..."
-    brew install --cask google-chrome
-fi
-
-# ── 6. Enable Chrome JavaScript from Apple Events ────
-echo "→ Enabling Chrome JavaScript from Apple Events..."
-defaults write com.google.Chrome AllowJavaScriptAppleEvents -bool true
-echo "✓ Chrome AppleScript access enabled"
-
-# ── 7. macOS Mail.app ────────────────────────────────
-if [ -d "/System/Applications/Mail.app" ] || [ -d "/Applications/Mail.app" ]; then
-    echo "✓ Mail.app found"
-else
-    echo "⚠ Mail.app not found (comes built-in with macOS)"
-fi
-
-# ── 8. Get user config ───────────────────────────────
-echo ""
-if [ -z "$SF_NOTIFY_EMAIL" ]; then
-    read -p "→ Enter your email for notifications: " SF_NOTIFY_EMAIL
-    if [ -z "$SF_NOTIFY_EMAIL" ]; then
-        echo "⚠ No email provided. You can set SF_NOTIFY_EMAIL later."
-        SF_NOTIFY_EMAIL="not-configured"
-    fi
-fi
-echo "✓ Notifications: $SF_NOTIFY_EMAIL"
-
-if [ -z "$SUPPORTSHELL_USER" ]; then
-    read -p "→ Enter your Support Shell username (for case comments via Hydra API, or press Enter to skip): " SUPPORTSHELL_USER
-fi
-if [ -n "$SUPPORTSHELL_USER" ]; then
-    echo "✓ Support Shell: $SUPPORTSHELL_USER (comments via Hydra API)"
-else
-    echo "⚠ No Support Shell user. Comments won't be fetched."
-fi
-
-# Save to config
-mkdir -p "$STATE_DIR"
-python3 -c "
-import json
-cfg = {}
-try:
-    with open('$STATE_DIR/sf-poller-config.json') as f:
-        cfg = json.load(f)
-except: pass
-cfg['notify_email'] = '$SF_NOTIFY_EMAIL'
-if '$SUPPORTSHELL_USER':
-    cfg['supportshell_user'] = '$SUPPORTSHELL_USER'
-with open('$STATE_DIR/sf-poller-config.json', 'w') as f:
-    json.dump(cfg, f, indent=2)
-"
-
-# ── 9. Copy scripts ─────────────────────────────────
-echo "→ Installing scripts to $BIN_DIR..."
-cp sf-case-poller "$BIN_DIR/sf-case-poller"
-cp local-mailserver "$BIN_DIR/local-mailserver"
-chmod +x "$BIN_DIR/sf-case-poller" "$BIN_DIR/local-mailserver"
-echo "  Using Python: $PYTHON"
-
-# ── 9. LaunchAgent plists ────────────────────────────
-echo "→ Installing LaunchAgents..."
-
-cat > "$LA_DIR/com.sf-notify.mailserver.plist" <<PLIST
+# 3. Install LaunchAgent
+echo "[3/4] Installing LaunchAgent (auto-start on login)..."
+mkdir -p "$USER_HOME/Library/LaunchAgents"
+cat > "$USER_HOME/Library/LaunchAgents/com.${SUPPORTSHELL_USER}.sf-case-poller.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.sf-notify.mailserver</string>
+    <string>com.${SUPPORTSHELL_USER}.sf-case-poller</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$PYTHON</string>
-        <string>$BIN_DIR/local-mailserver</string>
+        <string>/usr/bin/python3</string>
+        <string>${USER_HOME}/.local/bin/sf-case-poller</string>
+        <string>poll</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/local-mailserver-stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/local-mailserver-stderr.log</string>
-</dict>
-</plist>
-PLIST
-
-cat > "$LA_DIR/com.sf-notify.case-poller.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.sf-notify.case-poller</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$PYTHON</string>
-        <string>$BIN_DIR/sf-case-poller</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/sf-case-poller-stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/sf-case-poller-stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>SF_POLL_INTERVAL</key>
-        <string>300</string>
-        <key>SF_NOTIFY_EMAIL</key>
-        <string>$SF_NOTIFY_EMAIL</string>
+        <string>60</string>
     </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>${USER_HOME}/Library/Logs/sf-case-poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>${USER_HOME}/Library/Logs/sf-case-poller.log</string>
 </dict>
 </plist>
-PLIST
+EOF
+
+# Load the agent
+launchctl unload "$USER_HOME/Library/LaunchAgents/com.${SUPPORTSHELL_USER}.sf-case-poller.plist" 2>/dev/null || true
+launchctl load "$USER_HOME/Library/LaunchAgents/com.${SUPPORTSHELL_USER}.sf-case-poller.plist"
+
+# 4. Start
+echo "[4/4] Starting poller..."
+launchctl start "com.${SUPPORTSHELL_USER}.sf-case-poller"
+sleep 3
 
 echo ""
-echo "╔═══════════════════════════════════════════════╗"
-echo "║   ✅ Installation complete!                   ║"
-echo "╚═══════════════════════════════════════════════╝"
+echo "=== INSTALLED SUCCESSFULLY ==="
 echo ""
-
-# ── 10. Start all services ───────────────────────────
-echo "→ Starting all services..."
-
-# Start Mail.app if not running
-if ! pgrep -x "Mail" > /dev/null; then
-    echo "  → Opening Mail.app..."
-    open -a Mail
-    sleep 2
-fi
-
-# Start Chrome if not running
-if ! pgrep -x "Google Chrome" > /dev/null; then
-    echo "  → Opening Google Chrome..."
-    open -a "Google Chrome"
-    sleep 3
-fi
-
-# Start mail server (dashboard + SMTP)
-launchctl unload "$LA_DIR/com.sf-notify.mailserver.plist" 2>/dev/null || true
-sleep 1
-launchctl load "$LA_DIR/com.sf-notify.mailserver.plist"
-echo "  ✓ Mail Server + Dashboard started (port 8090)"
-
-# Start poller
-launchctl unload "$LA_DIR/com.sf-notify.case-poller.plist" 2>/dev/null || true
-sleep 1
-launchctl load "$LA_DIR/com.sf-notify.case-poller.plist"
-echo "  ✓ SF Case Poller started (every 5 min)"
-
+echo "Prerequisites (do these once):"
+echo "  1. Open Chrome with your Salesforce case list view"
+echo "  2. SSH must work: ssh ${SUPPORTSHELL_USER}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+echo "  3. Run on supportshell: redhat-hydra-auth --production"
 echo ""
-echo "╔═══════════════════════════════════════════════╗"
-echo "║  🚀 All services running!                    ║"
-echo "╚═══════════════════════════════════════════════╝"
+echo "Commands:"
+echo "  sf-case-poller --status    # Check status"
+echo "  sf-case-poller --health    # Health check"
+echo "  sf-case-poller --history   # Notification history"
+echo "  sf-case-poller --test-email # Test email"
 echo ""
-echo "  Dashboard:  http://localhost:8090"
-echo "  → Open the dashboard and paste your Salesforce"
-echo "    case list view URL to start monitoring."
+echo "  launchctl stop com.${SUPPORTSHELL_USER}.sf-case-poller   # Stop"
+echo "  launchctl start com.${SUPPORTSHELL_USER}.sf-case-poller  # Start"
 echo ""
-  echo "  Make sure:"
-echo "    1. Chrome is logged into Salesforce"
-echo "    2. Mail.app is configured with your email"
+echo "Logs: tail -f ~/Library/Logs/sf-case-poller.log"
 echo ""
-echo "  Other commands:"
-echo "    ./stop.sh           — Stop all services"
-echo "    ./uninstall.sh      — Remove everything"
-echo ""
-echo "  Logs: ~/Library/Logs/sf-case-poller.log"
-
-# Open dashboard in browser
-open http://localhost:8090
