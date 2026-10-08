@@ -69,20 +69,41 @@ else
     echo "⚠ Mail.app not found (comes built-in with macOS)"
 fi
 
-# ── 8. Get user email ────────────────────────────────
+# ── 8. Get user config ───────────────────────────────
+echo ""
 if [ -z "$SF_NOTIFY_EMAIL" ]; then
-    echo ""
     read -p "→ Enter your email for notifications: " SF_NOTIFY_EMAIL
     if [ -z "$SF_NOTIFY_EMAIL" ]; then
         echo "⚠ No email provided. You can set SF_NOTIFY_EMAIL later."
         SF_NOTIFY_EMAIL="not-configured"
     fi
 fi
-echo "✓ Notifications will be sent to: $SF_NOTIFY_EMAIL"
+echo "✓ Notifications: $SF_NOTIFY_EMAIL"
+
+if [ -z "$SUPPORTSHELL_USER" ]; then
+    read -p "→ Enter your Support Shell username (for case comments via Hydra API, or press Enter to skip): " SUPPORTSHELL_USER
+fi
+if [ -n "$SUPPORTSHELL_USER" ]; then
+    echo "✓ Support Shell: $SUPPORTSHELL_USER (comments via Hydra API)"
+else
+    echo "⚠ No Support Shell user. Comments won't be fetched."
+fi
 
 # Save to config
 mkdir -p "$STATE_DIR"
-echo "{\"notify_email\": \"$SF_NOTIFY_EMAIL\"}" > "$STATE_DIR/sf-poller-config.json"
+python3 -c "
+import json
+cfg = {}
+try:
+    with open('$STATE_DIR/sf-poller-config.json') as f:
+        cfg = json.load(f)
+except: pass
+cfg['notify_email'] = '$SF_NOTIFY_EMAIL'
+if '$SUPPORTSHELL_USER':
+    cfg['supportshell_user'] = '$SUPPORTSHELL_USER'
+with open('$STATE_DIR/sf-poller-config.json', 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
 
 # ── 9. Copy scripts ─────────────────────────────────
 echo "→ Installing scripts to $BIN_DIR..."

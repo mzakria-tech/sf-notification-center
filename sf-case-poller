@@ -397,89 +397,83 @@ def scrape_cases():
     return cases, columns
 
 
-def _fetch_comments_temp_tab(case_id: str) -> list[dict]:
-    """Open a temporary Chrome tab, scrape case comments, then close the tab."""
-    import base64
-    import tempfile
+SUPPORTSHELL_HOST = os.environ.get(
+    "SUPPORTSHELL_HOST",
+    "supportshell-1.sush-001.prod.us-west-2.aws.redhat.com",
+)
 
-    case_url = f"https://redhatsupport.lightning.force.com/lightning/r/Case/{case_id}/view"
-    comment_js = """
-    (function() {
-        var comments = [];
-        // Try multiple selectors for case comments/feed
-        var selectors = [
-            '.cuf-feedItem', '.feedItemBody', '[data-aura-class*="feed"]',
-            '.slds-feed__item', '.forceChatterFeedBody',
-            '.caseCommentList li', '.caseComment',
-            '[class*="comment"]', '[class*="Comment"]',
-            '.slds-post', '.feedElement'
-        ];
-        var feedItems = [];
-        for (var s = 0; s < selectors.length; s++) {
-            var items = document.querySelectorAll(selectors[s]);
-            if (items.length > 0) { feedItems = items; break; }
-        }
-        for (var i = 0; i < feedItems.length && i < 5; i++) {
-            var item = feedItems[i];
-            var bodyEl = item.querySelector('.feedItemText, .cuf-feedBodyText, .slds-post__content, p, .messageBody, .forceChatterMessageBodyRenderer');
-            var authorEl = item.querySelector('.feedItemAuthor, .cuf-feedItemAuthor, a[data-aura-class*="user"], .actor .name, a.slds-truncate');
-            var dateEl = item.querySelector('.feedItemTimestamp, .cuf-feedItemTimestamp, time, .timeStamp, .uiOutputDateTime');
-            var body = bodyEl ? bodyEl.textContent.trim() : item.textContent.trim().substring(0, 500);
-            var author = authorEl ? authorEl.textContent.trim() : '';
-            var date = dateEl ? (dateEl.getAttribute('datetime') || dateEl.textContent.trim()) : '';
-            if (body && body.length > 5) {
-                comments.push({body: body.substring(0, 500), author: author, date: date});
-            }
-        }
-        // Fallback: any related list with "comment" in header
-        if (comments.length === 0) {
-            var panels = document.querySelectorAll('.slds-card, .forceRelatedListSingleContainer, [class*="relatedList"]');
-            for (var p = 0; p < panels.length; p++) {
-                var header = panels[p].querySelector('h2, .slds-card__header-title, span[title]');
-                if (header && /comment/i.test(header.textContent)) {
-                    var rows = panels[p].querySelectorAll('li, tr, .slds-item, [class*="row"]');
-                    for (var j = 0; j < rows.length && j < 5; j++) {
-                        var txt = rows[j].textContent.trim();
-                        if (txt.length > 5) comments.push({body: txt.substring(0, 500), author: '', date: ''});
-                    }
-                }
-            }
-        }
-        return JSON.stringify(comments);
-    })()
-    """
-    b64 = base64.b64encode(comment_js.encode("utf-8")).decode("ascii")
-    exec_line = f'execute javascript "eval(atob(\'{b64}\'))"'
+def _get_supportshell_user() -> str:
+    env = os.environ.get("SUPPORTSHELL_USER")
+    if env:
+        return env
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f).get("supportshell_user", "")
+    except Exception:
+        return ""
 
-    ascript = f'''
-tell application "Google Chrome"
-    -- Open a new temporary tab
-    tell window 1
-        set tempTab to make new tab with properties {{URL:"{case_url}"}}
-    end tell
-    delay 10
-    -- Scrape comments
-    tell tempTab
-        set r to {exec_line}
-    end tell
-    -- Close the temp tab
-    close tempTab
-    return r
-end tell
+SUPPORTSHELL_USER = _get_supportshell_user()
+
+
+def _fetch_comments_hydra(case_number: str) -> list[dict]:
+    """Fetch case comments via Hydra REST API on Support Shell."""
+    if not SUPPORTSHELL_USER:
+        # Try to detect SSH user from environment
+        ssh_user = os.environ.get("USER", "")
+        if not ssh_user:
+            log("no SUPPORTSHELL_USER set, skipping comment fetch")
+            return []
+    else:
+        ssh_user = SUPPORTSHELL_USER
+
+    script = f'''
+import json, urllib.request, urllib.parse
+try:
+    with open("/home/remote/{ssh_user}/.yank/oidc-tokens.json") as f:
+        d = json.load(f)
+    data = urllib.parse.urlencode({{
+        "grant_type": "refresh_token",
+        "refresh_token": d["refresh_token"],
+        "client_id": "cee-supportshell-deviceauth"
+    }}).encode()
+    req = urllib.request.Request(
+        "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token", data)
+    tokens = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    at = tokens["access_token"]
+    req2 = urllib.request.Request(
+        "https://access.redhat.com/hydra/rest/cases/{case_number}/comments")
+    req2.add_header("Authorization", "Bearer " + at)
+    req2.add_header("Accept", "application/json")
+    resp = urllib.request.urlopen(req2, timeout=15)
+    comments = json.loads(resp.read())
+    result = []
+    for c in comments[-5:]:
+        author = c.get("createdByUser", "")
+        if isinstance(author, dict):
+            author = author.get("fullName", author.get("name", ""))
+        date = c.get("createdDate", "")
+        body = c.get("commentBody", c.get("text", ""))
+        public = c.get("isPublic", True)
+        result.append({{"author": author, "date": date, "body": str(body)[:500], "isPublic": public}})
+    print(json.dumps(result))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
 '''
-    fd, path = tempfile.mkstemp(suffix=".applescript")
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(ascript)
-        r = subprocess.run(["osascript", path], capture_output=True, text=True, timeout=30)
-    finally:
-        os.unlink(path)
-
-    if r.returncode != 0:
-        return []
-    try:
-        return json.loads((r.stdout or "").strip())[:5]
-    except (json.JSONDecodeError, ValueError):
+        r = subprocess.run(
+            ["ssh", f"{ssh_user}@{SUPPORTSHELL_HOST}", "python3", "-c", json.dumps(script)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            log(f"SSH comment fetch failed: {(r.stderr or '').strip()[:200]}")
+            return []
+        data = json.loads((r.stdout or "").strip())
+        if isinstance(data, dict) and "error" in data:
+            log(f"Hydra comment error: {data['error']}")
+            return []
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        log(f"comment fetch exception: {exc}")
         return []
 
 
@@ -490,10 +484,11 @@ def _format_comments(comments: list[dict]) -> str:
     lines = ["\n--- Recent Comments ---"]
     for c in comments:
         author = c.get("author", "").strip() or "Unknown"
-        date = (c.get("date") or "")[:16].replace("T", " ")
+        date = (c.get("date") or "")[:19].replace("T", " ")
+        visibility = "Public" if c.get("isPublic", True) else "Private"
         body = (c.get("body") or "").strip()
         if body:
-            lines.append(f"\n{author} ({date}):")
+            lines.append(f"\n[{visibility}] {author} ({date}):")
             lines.append(body[:400])
     return "\n".join(lines)
 
@@ -542,12 +537,12 @@ def poll_once() -> int:
 
         # Check for status change
         if old_status is not None and old_status.strip().lower() != status.strip().lower():
-            # Fetch recent comments from case detail page
+            # Fetch recent comments via Hydra API on Support Shell
             fetched_comments = []
-            if cid:
+            if num:
                 try:
-                    log(f"fetching comments for {num} (status changed)...")
-                    fetched_comments = _fetch_comments_temp_tab(cid)
+                    log(f"fetching comments for {num} via Hydra...")
+                    fetched_comments = _fetch_comments_hydra(num)
                     log(f"got {len(fetched_comments)} comments for {num}")
                 except Exception as exc:
                     log(f"comment fetch failed for {num}: {exc}")
