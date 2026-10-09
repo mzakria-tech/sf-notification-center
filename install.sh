@@ -160,14 +160,18 @@ ensure_ssh_key() {
 
 install_key_on_supportshell() {
     # Prefer Kerberos if available, else password auth — user only enters password once
+    # Do NOT hide errors — user must see password prompt / failure reason
     if command -v klist >/dev/null 2>&1 && klist -s 2>/dev/null; then
         ssh-copy-id -o PreferredAuthentications=gssapi-with-mic,password \
-            -o StrictHostKeyChecking=no "$SSH_HOST" 2>/dev/null && return 0
+            -o StrictHostKeyChecking=no "$SSH_HOST" && return 0
     fi
-    ssh-copy-id -o StrictHostKeyChecking=no "$SSH_HOST" 2>/dev/null
+    ssh-copy-id -o PreferredAuthentications=password,keyboard-interactive,publickey \
+        -o StrictHostKeyChecking=no -o NumberOfPasswordPrompts=3 "$SSH_HOST"
 }
 
 step "1b/4" "SSH to supportshell (automatic)"
+echo -e "  Target: ${BOLD}$SSH_HOST${N}"
+echo -e "  ${Y}Connect Red Hat VPN first if not already connected.${N}"
 ensure_ssh_key
 
 if ssh_ok; then
@@ -175,32 +179,44 @@ if ssh_ok; then
 else
     warn "SSH not ready — fixing automatically..."
 
+    # Confirm supportshell username (macOS $USER must match RH login)
+    echo -e "  Using supportshell user: ${BOLD}$SSH_USER${N}"
+    echo -n "  Press Enter to keep, or type your Red Hat username: "
+    read -r NEW_USER || true
+    if [ -n "$NEW_USER" ]; then
+        SSH_USER="$NEW_USER"
+        SSH_HOST="${SSH_USER}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+        "$PYTHON" -c "import json; p='$CFG'; d=json.load(open(p)); d['supportshell_user']='$SSH_USER'; json.dump(d, open(p,'w'), indent=2)" 2>/dev/null || true
+        ok "Updated supportshell user to $SSH_USER"
+    fi
+
     # Try Kerberos ticket (same auth Red Hat GitLab uses)
     if command -v kinit >/dev/null 2>&1; then
         if ! klist -s 2>/dev/null; then
-            echo -e "  ${Y}Enter your Red Hat password once (Kerberos) — then the app runs by itself:${N}"
-            kinit "${SSH_USER}@REDHAT.COM" 2>/dev/null || true
+            echo -e "  ${Y}Enter your Red Hat password once (Kerberos):${N}"
+            kinit "${SSH_USER}@REDHAT.COM" || true
         fi
         if ssh -o BatchMode=yes -o PreferredAuthentications=gssapi-with-mic \
             -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
             "$SSH_HOST" "echo SSH_OK" 2>/dev/null | grep -q SSH_OK; then
             ok "SSH works via Kerberos"
-            # Install key so LaunchAgent works without Kerberos later
             install_key_on_supportshell && ok "SSH key installed for background services" || true
         fi
     fi
 
     if ! ssh_ok; then
-        echo -e "  ${Y}Installing your SSH key on supportshell (enter Red Hat password once):${N}"
+        echo -e "  ${Y}Installing SSH key on supportshell — enter Red Hat password when prompted:${N}"
         install_key_on_supportshell || true
     fi
 
     if ssh_ok; then
         ok "SSH ready — application will run automatically"
     else
-        fail "Could not reach supportshell — connect Red Hat VPN and re-run ./install.sh"
-        echo -e "    ${Y}VPN is required. After VPN is up: ./install.sh${N}"
-        # Continue install so dashboard shows VPN/SSH status + fix buttons
+        fail "SSH still failing — cases will not load until this works"
+        echo -e "    ${Y}1. Connect Red Hat VPN${N}"
+        echo -e "    ${Y}2. Run:  sf-ssh-setup${N}"
+        echo -e "    ${Y}   or:   ssh-copy-id $SSH_HOST${N}"
+        echo -e "    ${Y}3. Then:  launchctl start com.${USER_NAME}.sf-case-poller${N}"
     fi
 fi
 
