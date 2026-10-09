@@ -169,17 +169,13 @@ install_key_on_supportshell() {
         -o StrictHostKeyChecking=no -o NumberOfPasswordPrompts=3 "$SSH_HOST"
 }
 
-step "1b/4" "SSH to supportshell (automatic)"
+step "1b/4" "SSH to supportshell (automatic — one password if needed)"
 echo -e "  Target: ${BOLD}$SSH_HOST${N}"
-echo -e "  ${Y}Connect Red Hat VPN first if not already connected.${N}"
+echo -e "  ${Y}Connect Red Hat VPN first. Install will not finish until SSH works.${N}"
 ensure_ssh_key
 
-if ssh_ok; then
-    ok "SSH already works — no setup needed"
-else
-    warn "SSH not ready — fixing automatically..."
-
-    # Confirm supportshell username (macOS $USER must match RH login)
+# Confirm supportshell username once (macOS $USER must match RH login)
+if ! ssh_ok; then
     echo -e "  Using supportshell user: ${BOLD}$SSH_USER${N}"
     echo -n "  Press Enter to keep, or type your Red Hat username: "
     read -r NEW_USER || true
@@ -189,36 +185,34 @@ else
         "$PYTHON" -c "import json; p='$CFG'; d=json.load(open(p)); d['supportshell_user']='$SSH_USER'; json.dump(d, open(p,'w'), indent=2)" 2>/dev/null || true
         ok "Updated supportshell user to $SSH_USER"
     fi
+fi
 
-    # Try Kerberos ticket (same auth Red Hat GitLab uses)
-    if command -v kinit >/dev/null 2>&1; then
-        if ! klist -s 2>/dev/null; then
-            echo -e "  ${Y}Enter your Red Hat password once (Kerberos):${N}"
-            kinit "${SSH_USER}@REDHAT.COM" || true
-        fi
-        if ssh -o BatchMode=yes -o PreferredAuthentications=gssapi-with-mic \
-            -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
-            "$SSH_HOST" "echo SSH_OK" 2>/dev/null | grep -q SSH_OK; then
-            ok "SSH works via Kerberos"
-            install_key_on_supportshell && ok "SSH key installed for background services" || true
-        fi
+# Loop until SSH works — password may be asked once; after that app runs alone
+SSH_SETUP_TRIES=0
+while ! ssh_ok; do
+    SSH_SETUP_TRIES=$((SSH_SETUP_TRIES + 1))
+    if [ "$SSH_SETUP_TRIES" -gt 3 ]; then
+        fail "SSH still failing after 3 attempts"
+        echo -e "    ${Y}Connect Red Hat VPN, confirm username, then re-run: ./install.sh${N}"
+        exit 1
+    fi
+    warn "SSH not ready (attempt $SSH_SETUP_TRIES/3) — fixing automatically..."
+
+    if command -v kinit >/dev/null 2>&1 && ! klist -s 2>/dev/null; then
+        echo -e "  ${Y}Enter Red Hat password (Kerberos) — once only:${N}"
+        kinit "${SSH_USER}@REDHAT.COM" || true
     fi
 
-    if ! ssh_ok; then
-        echo -e "  ${Y}Installing SSH key on supportshell — enter Red Hat password when prompted:${N}"
-        install_key_on_supportshell || true
-    fi
+    echo -e "  ${Y}Installing SSH key on supportshell — enter Red Hat password if asked:${N}"
+    install_key_on_supportshell || true
 
     if ssh_ok; then
-        ok "SSH ready — application will run automatically"
-    else
-        fail "SSH still failing — cases will not load until this works"
-        echo -e "    ${Y}1. Connect Red Hat VPN${N}"
-        echo -e "    ${Y}2. Run:  sf-ssh-setup${N}"
-        echo -e "    ${Y}   or:   ssh-copy-id $SSH_HOST${N}"
-        echo -e "    ${Y}3. Then:  launchctl start com.${USER_NAME}.sf-case-poller${N}"
+        break
     fi
-fi
+    echo -e "  ${R}Not connected yet. Check VPN is ON, then try again...${N}"
+    sleep 2
+done
+ok "SSH ready — application will run automatically from here"
 
 # Pre-warm SSH + first poll in background (runs during service startup)
 if ssh_ok; then
