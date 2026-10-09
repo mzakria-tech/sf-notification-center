@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
@@ -477,7 +478,7 @@ def _render(data: dict) -> str:
 
     ms_fix = "" if data["mailserver"]["running"] else start_btn("mailserver", "▶ Start Mail Server")
     pl_fix = "" if data["poller"]["running"] else start_btn("poller", "▶ Start Poller")
-    cr_fix = "" if data["chrome"]["running"] else start_btn("ssh", "🔧 Test SSH")
+    cr_fix = "" if data["chrome"]["running"] else start_btn("ssh", "🔧 Fix SSH (auto)")
     ma_fix = "" if data["mailapp"]["running"] else start_btn("mailapp", "▶ Open Mail.app")
     vpn_fix = "" if data["vpn"]["running"] else '<div class="svc-fix" style="font-size:11px">Connect Red Hat VPN</div>'
 
@@ -630,23 +631,35 @@ class WebHandler(BaseHTTPRequestHandler):
                 _watchdog_log("✓ Poller restarted (dashboard button)")
 
             elif svc == "ssh":
-                # Test SSH and report
+                # Test SSH; if failed, open Terminal to auto-run sf-ssh-setup (password once)
                 try:
                     cfg = _read_config()
                     ssh_user = cfg.get("supportshell_user", os.environ.get("USER", "mzakria"))
                     ssh_host = f"{ssh_user}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
                     r = subprocess.run(
-                        ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", ssh_host, "echo ok"],
+                        ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+                         "-o", "PreferredAuthentications=publickey,gssapi-with-mic",
+                         "-o", "GSSAPIAuthentication=yes",
+                         "-o", "StrictHostKeyChecking=no", ssh_host, "echo ok"],
                         capture_output=True, text=True, timeout=15)
                     if "ok" in (r.stdout or ""):
                         SSH_STATUS["running"] = True
                         result = {"ok": True, "msg": "SSH connected OK"}
                         _watchdog_log("✓ SSH tested OK (dashboard button)")
                     else:
-                        result = {"ok": False, "msg": f"SSH failed: {(r.stderr or '').strip()[:80]}"}
-                        _watchdog_log("✗ SSH test failed (dashboard button)")
+                        setup = os.path.expanduser("~/.local/bin/sf-ssh-setup")
+                        if os.path.exists(setup) and sys.platform == "darwin":
+                            subprocess.Popen([
+                                "osascript", "-e",
+                                f'tell application "Terminal" to do script "{setup}"'
+                            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            result = {"ok": True, "msg": "Opened Terminal — enter password once if asked"}
+                            _watchdog_log("⚠ SSH failed — opened sf-ssh-setup in Terminal")
+                        else:
+                            result = {"ok": False, "msg": f"SSH failed — run: sf-ssh-setup"}
+                            _watchdog_log("✗ SSH test failed (dashboard button)")
                 except subprocess.TimeoutExpired:
-                    result = {"ok": False, "msg": "SSH timed out — check VPN"}
+                    result = {"ok": False, "msg": "SSH timed out — connect Red Hat VPN"}
                 except Exception as e:
                     result = {"ok": False, "msg": str(e)[:80]}
 

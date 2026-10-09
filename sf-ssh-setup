@@ -1,0 +1,71 @@
+#!/bin/bash
+# Auto-setup SSH to supportshell — called by install.sh and dashboard Fix button.
+# User may enter Red Hat password once; after that the app runs without more commands.
+set -e
+
+USER_NAME="${USER:-$(whoami)}"
+CFG="$HOME/.local/state/sf-poller-config.json"
+if [ -f "$CFG" ]; then
+    SSH_USER=$(python3 -c "import json; print(json.load(open('$CFG')).get('supportshell_user','$USER_NAME'))" 2>/dev/null || echo "$USER_NAME")
+else
+    SSH_USER="$USER_NAME"
+fi
+SSH_HOST="${SSH_USER}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
+
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
+ok()   { echo -e "  ${G}✓${N} $1"; }
+warn() { echo -e "  ${Y}⚠${N} $1"; }
+fail() { echo -e "  ${R}✗${N} $1"; }
+
+ssh_ok() {
+    ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
+        -o PreferredAuthentications=publickey,gssapi-with-mic \
+        -o GSSAPIAuthentication=yes \
+        "$SSH_HOST" "echo SSH_OK" 2>/dev/null | grep -q SSH_OK
+}
+
+echo ""
+echo "SF Notification Center — SSH auto-setup"
+echo "Target: $SSH_HOST"
+echo ""
+
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+if [ ! -f "$HOME/.ssh/id_ed25519" ] && [ ! -f "$HOME/.ssh/id_rsa" ]; then
+    ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -q
+    ok "Generated SSH key"
+fi
+
+if ssh_ok; then
+    ok "SSH already works"
+    exit 0
+fi
+
+warn "SSH not ready — fixing..."
+
+# Kerberos (same as GitLab / Red Hat internal)
+if command -v kinit >/dev/null 2>&1; then
+    if ! klist -s 2>/dev/null; then
+        echo -e "  ${Y}Enter Red Hat password once (Kerberos):${N}"
+        kinit "${SSH_USER}@REDHAT.COM" || true
+    fi
+fi
+
+# Install public key for background LaunchAgent (no interactive auth later)
+echo -e "  ${Y}Installing SSH key on supportshell (password once if asked):${N}"
+if command -v klist >/dev/null 2>&1 && klist -s 2>/dev/null; then
+    ssh-copy-id -o PreferredAuthentications=gssapi-with-mic,password \
+        -o StrictHostKeyChecking=no "$SSH_HOST" 2>/dev/null || true
+fi
+ssh-copy-id -o StrictHostKeyChecking=no "$SSH_HOST" 2>/dev/null || true
+
+if ssh_ok; then
+    ok "SSH ready — restarting poller..."
+    LABEL="com.${USER_NAME}.sf-case-poller"
+    launchctl stop "$LABEL" 2>/dev/null || true
+    launchctl start "$LABEL" 2>/dev/null || true
+    ok "Done. Refresh dashboard: http://localhost:8090"
+    exit 0
+fi
+
+fail "Still failing. Connect Red Hat VPN and re-run: sf-ssh-setup"
+exit 1

@@ -78,6 +78,7 @@ if [ "${1:-}" = "uninstall" ]; then
     step "3/4" "Removing scripts and state"
     rm -f "$BIN_DIR/sf-case-poller"
     rm -f "$BIN_DIR/local-mailserver"
+    rm -f "$BIN_DIR/sf-ssh-setup"
     rm -f "$STATE_DIR/sf-notification-center.db"
     rm -f "$STATE_DIR/sf-poller-config.json"
     rm -f "$STATE_DIR/sf-case-status.json"
@@ -119,6 +120,7 @@ fi
 mkdir -p "$BIN_DIR" "$STATE_DIR" "$LOG_DIR"
 cp "$REPO_DIR/sf-case-poller" "$BIN_DIR/sf-case-poller" && chmod +x "$BIN_DIR/sf-case-poller"
 cp "$REPO_DIR/local-mailserver" "$BIN_DIR/local-mailserver" && chmod +x "$BIN_DIR/local-mailserver"
+cp "$REPO_DIR/sf-ssh-setup" "$BIN_DIR/sf-ssh-setup" && chmod +x "$BIN_DIR/sf-ssh-setup"
 
 # Add to PATH in shell rc
 SHELL_RC="$HOME_DIR/.bashrc"
@@ -140,11 +142,75 @@ SSH_HOST="${SSH_USER}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
 SSH_CTRL="/tmp/sf-ssh-ctrl-${USER_NAME}"
 ok "Scripts, config, PATH ready"
 
+# ── Auto SSH setup (no manual ssh-copy-id / kinit needed) ──
+ssh_ok() {
+    ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
+        -o PreferredAuthentications=publickey,gssapi-with-mic \
+        "$SSH_HOST" "echo SSH_OK" 2>/dev/null | grep -q SSH_OK
+}
+
+ensure_ssh_key() {
+    mkdir -p "$HOME_DIR/.ssh"
+    chmod 700 "$HOME_DIR/.ssh"
+    if [ ! -f "$HOME_DIR/.ssh/id_ed25519" ] && [ ! -f "$HOME_DIR/.ssh/id_rsa" ]; then
+        ssh-keygen -t ed25519 -N "" -f "$HOME_DIR/.ssh/id_ed25519" -q
+        ok "Generated SSH key (~/.ssh/id_ed25519)"
+    fi
+}
+
+install_key_on_supportshell() {
+    # Prefer Kerberos if available, else password auth — user only enters password once
+    if command -v klist >/dev/null 2>&1 && klist -s 2>/dev/null; then
+        ssh-copy-id -o PreferredAuthentications=gssapi-with-mic,password \
+            -o StrictHostKeyChecking=no "$SSH_HOST" 2>/dev/null && return 0
+    fi
+    ssh-copy-id -o StrictHostKeyChecking=no "$SSH_HOST" 2>/dev/null
+}
+
+step "1b/4" "SSH to supportshell (automatic)"
+ensure_ssh_key
+
+if ssh_ok; then
+    ok "SSH already works — no setup needed"
+else
+    warn "SSH not ready — fixing automatically..."
+
+    # Try Kerberos ticket (same auth Red Hat GitLab uses)
+    if command -v kinit >/dev/null 2>&1; then
+        if ! klist -s 2>/dev/null; then
+            echo -e "  ${Y}Enter your Red Hat password once (Kerberos) — then the app runs by itself:${N}"
+            kinit "${SSH_USER}@REDHAT.COM" 2>/dev/null || true
+        fi
+        if ssh -o BatchMode=yes -o PreferredAuthentications=gssapi-with-mic \
+            -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            "$SSH_HOST" "echo SSH_OK" 2>/dev/null | grep -q SSH_OK; then
+            ok "SSH works via Kerberos"
+            # Install key so LaunchAgent works without Kerberos later
+            install_key_on_supportshell && ok "SSH key installed for background services" || true
+        fi
+    fi
+
+    if ! ssh_ok; then
+        echo -e "  ${Y}Installing your SSH key on supportshell (enter Red Hat password once):${N}"
+        install_key_on_supportshell || true
+    fi
+
+    if ssh_ok; then
+        ok "SSH ready — application will run automatically"
+    else
+        fail "Could not reach supportshell — connect Red Hat VPN and re-run ./install.sh"
+        echo -e "    ${Y}VPN is required. After VPN is up: ./install.sh${N}"
+        # Continue install so dashboard shows VPN/SSH status + fix buttons
+    fi
+fi
+
 # Pre-warm SSH + first poll in background (runs during service startup)
-(ssh -o ControlMaster=yes -o ControlPath="$SSH_CTRL" \
-    -o ControlPersist=300 -o ConnectTimeout=10 -o BatchMode=yes \
-    -N "$SSH_HOST" &>/dev/null &)
-"$PYTHON" "$BIN_DIR/sf-case-poller" --once &>/dev/null &
+if ssh_ok; then
+    (ssh -o ControlMaster=yes -o ControlPath="$SSH_CTRL" \
+        -o ControlPersist=300 -o ConnectTimeout=10 -o BatchMode=yes \
+        -N "$SSH_HOST" &>/dev/null &)
+    "$PYTHON" "$BIN_DIR/sf-case-poller" --once &>/dev/null &
+fi
 
 # ────────────────────────────────────────────────────────────────
 step "2/4" "Starting services"
