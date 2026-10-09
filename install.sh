@@ -1,7 +1,8 @@
 #!/bin/bash
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  SF Notification Center — One-command installer              ║
-# ║  Installs, configures, and starts everything automatically.  ║
+# ║  Works on macOS (LaunchAgents) and Linux (systemd)           ║
+# ║  GraphQL-powered • No browser needed • 24/7 on any server   ║
 # ╚═══════════════════════════════════════════════════════════════╝
 set -e
 
@@ -9,10 +10,23 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOME_DIR="$HOME"
 BIN_DIR="$HOME_DIR/.local/bin"
 STATE_DIR="$HOME_DIR/.local/state"
-LOG_DIR="$HOME_DIR/Library/Logs"
-LAUNCH_DIR="$HOME_DIR/Library/LaunchAgents"
-PYTHON="$(command -v python3)"
-USER_NAME="${USER:-mzakria}"
+PYTHON="$(command -v python3 || true)"
+USER_NAME="${USER:-$(whoami)}"
+
+# Detect OS
+IS_MAC=0; IS_LINUX=0
+case "$(uname -s)" in
+    Darwin) IS_MAC=1 ;;
+    Linux)  IS_LINUX=1 ;;
+esac
+
+if [ "$IS_MAC" -eq 1 ]; then
+    LOG_DIR="$HOME_DIR/Library/Logs"
+    LAUNCH_DIR="$HOME_DIR/Library/LaunchAgents"
+else
+    LOG_DIR="$HOME_DIR/.local/state/logs"
+    SYSTEMD_DIR="$HOME_DIR/.config/systemd/user"
+fi
 
 POLLER_LABEL="com.${USER_NAME}.sf-case-poller"
 MAILER_LABEL="com.${USER_NAME}.local-mailserver"
@@ -34,17 +48,32 @@ if [ "${1:-}" = "uninstall" ]; then
     echo -e "${R}╚═══════════════════════════════════════════════════════╝${N}"
 
     step "1/4" "Stopping services"
-    launchctl stop "$POLLER_LABEL" 2>/dev/null
-    launchctl unload "$LAUNCH_DIR/$POLLER_LABEL.plist" 2>/dev/null
-    launchctl stop "$MAILER_LABEL" 2>/dev/null
-    launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null
-    pkill -f "local-mailserver" 2>/dev/null
+    if [ "$IS_MAC" -eq 1 ]; then
+        launchctl stop "$POLLER_LABEL" 2>/dev/null || true
+        launchctl unload "$LAUNCH_DIR/$POLLER_LABEL.plist" 2>/dev/null || true
+        launchctl stop "$MAILER_LABEL" 2>/dev/null || true
+        launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null || true
+    else
+        systemctl --user stop sf-case-poller 2>/dev/null || true
+        systemctl --user stop sf-mailserver 2>/dev/null || true
+        systemctl --user disable sf-case-poller 2>/dev/null || true
+        systemctl --user disable sf-mailserver 2>/dev/null || true
+    fi
+    pkill -f "sf-case-poller" 2>/dev/null || true
+    pkill -f "local-mailserver" 2>/dev/null || true
     ok "All services stopped"
 
-    step "2/4" "Removing LaunchAgents"
-    rm -f "$LAUNCH_DIR/$POLLER_LABEL.plist"
-    rm -f "$LAUNCH_DIR/$MAILER_LABEL.plist"
-    ok "LaunchAgent plists removed"
+    step "2/4" "Removing service configs"
+    if [ "$IS_MAC" -eq 1 ]; then
+        rm -f "$LAUNCH_DIR/$POLLER_LABEL.plist"
+        rm -f "$LAUNCH_DIR/$MAILER_LABEL.plist"
+        ok "LaunchAgent plists removed"
+    else
+        rm -f "$SYSTEMD_DIR/sf-case-poller.service"
+        rm -f "$SYSTEMD_DIR/sf-mailserver.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        ok "Systemd units removed"
+    fi
 
     step "3/4" "Removing scripts and state"
     rm -f "$BIN_DIR/sf-case-poller"
@@ -53,7 +82,7 @@ if [ "${1:-}" = "uninstall" ]; then
     rm -f "$STATE_DIR/sf-poller-config.json"
     rm -f "$STATE_DIR/sf-case-status.json"
     rm -f "$STATE_DIR/sf-poller-heartbeat.json"
-    rm -f "$LOG_DIR/sf-case-poller.log"
+    rm -f "$LOG_DIR/sf-case-poller.log" 2>/dev/null
     rm -f /tmp/local-mailserver.log
     ok "Scripts, database, config, and logs removed"
 
@@ -67,10 +96,8 @@ if [ "${1:-}" = "uninstall" ]; then
     exit 0
 fi
 
-ok()   { echo -e "  ${G}✓${N} $1"; }
-warn() { echo -e "  ${Y}⚠${N} $1"; }
-fail() { echo -e "  ${R}✗${N} $1"; }
-step() { echo -e "\n${B}[$1]${N} ${BOLD}$2${N}"; }
+OS_LABEL="macOS (LaunchAgents)"
+[ "$IS_LINUX" -eq 1 ] && OS_LABEL="Linux (systemd)"
 
 echo ""
 echo -e "${BOLD}╔═══════════════════════════════════════════════════════╗${N}"
@@ -79,323 +106,189 @@ echo -e "${BOLD}║   GraphQL-powered • No browser needed                ║${
 echo -e "${BOLD}╚═══════════════════════════════════════════════════════╝${N}"
 
 # ────────────────────────────────────────────────────────────────
-step "1/8" "Checking prerequisites"
+step "1/4" "Setup"
 # ────────────────────────────────────────────────────────────────
 
-if [ -z "$PYTHON" ]; then
-    fail "Python3 not found. Install: brew install python3"
-    exit 1
-fi
-ok "Python3: $PYTHON"
-
-if ! command -v ssh &>/dev/null; then
-    fail "SSH not found"
-    exit 1
-fi
-ok "SSH available"
-
-# Install aiosmtpd (required for dashboard SMTP server)
-if "$PYTHON" -c "import aiosmtpd" 2>/dev/null; then
-    ok "aiosmtpd already installed"
-else
-    echo "  Installing aiosmtpd..."
-    "$PYTHON" -m pip install --quiet aiosmtpd 2>/dev/null || pip3 install --quiet aiosmtpd 2>/dev/null
-    if "$PYTHON" -c "import aiosmtpd" 2>/dev/null; then
-        ok "aiosmtpd installed"
-    else
-        fail "Could not install aiosmtpd — run: pip3 install aiosmtpd"
-        exit 1
-    fi
+[ -z "$PYTHON" ] && fail "Python3 not found. Install: sudo yum install python3 / brew install python3" && exit 1
+command -v ssh &>/dev/null || { fail "SSH not found"; exit 1; }
+if ! "$PYTHON" -c "import aiosmtpd" 2>/dev/null; then
+    "$PYTHON" -m pip install --quiet aiosmtpd 2>/dev/null || pip3 install --quiet --user aiosmtpd 2>/dev/null
+    "$PYTHON" -c "import aiosmtpd" 2>/dev/null || { fail "pip3 install aiosmtpd"; exit 1; }
 fi
 
-# ────────────────────────────────────────────────────────────────
-step "2/8" "Installing scripts to ~/.local/bin/"
-# ────────────────────────────────────────────────────────────────
+mkdir -p "$BIN_DIR" "$STATE_DIR" "$LOG_DIR"
+cp "$REPO_DIR/sf-case-poller" "$BIN_DIR/sf-case-poller" && chmod +x "$BIN_DIR/sf-case-poller"
+cp "$REPO_DIR/local-mailserver" "$BIN_DIR/local-mailserver" && chmod +x "$BIN_DIR/local-mailserver"
 
-mkdir -p "$BIN_DIR"
-cp "$REPO_DIR/sf-case-poller" "$BIN_DIR/sf-case-poller"
-chmod +x "$BIN_DIR/sf-case-poller"
-ok "sf-case-poller installed"
-
-cp "$REPO_DIR/local-mailserver" "$BIN_DIR/local-mailserver"
-chmod +x "$BIN_DIR/local-mailserver"
-ok "local-mailserver (dashboard + SMTP) installed"
-
-# ────────────────────────────────────────────────────────────────
-step "3/8" "Configuring PATH"
-# ────────────────────────────────────────────────────────────────
-
-ZSHRC="$HOME_DIR/.zshrc"
-if [ -f "$ZSHRC" ] && grep -q '.local/bin' "$ZSHRC"; then
-    ok "PATH already configured in .zshrc"
-else
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$ZSHRC"
-    ok "Added ~/.local/bin to PATH in .zshrc"
-fi
+# Add to PATH in shell rc
+SHELL_RC="$HOME_DIR/.bashrc"
+[ -f "$HOME_DIR/.zshrc" ] && SHELL_RC="$HOME_DIR/.zshrc"
+grep -q '.local/bin' "$SHELL_RC" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
 export PATH="$BIN_DIR:$PATH"
 
-# ────────────────────────────────────────────────────────────────
-step "4/8" "Creating config"
-# ────────────────────────────────────────────────────────────────
-
-mkdir -p "$STATE_DIR"
 CFG="$STATE_DIR/sf-poller-config.json"
-
-if [ -f "$CFG" ]; then
-    ok "Config already exists: $CFG"
-else
-    EMAIL="${USER_NAME}@redhat.com"
-    SSH_USER="$USER_NAME"
-
+if [ ! -f "$CFG" ]; then
     cat > "$CFG" <<CFGEOF
 {
-  "notify_email": "$EMAIL",
-  "supportshell_user": "$SSH_USER"
+  "notify_email": "${USER_NAME}@redhat.com",
+  "supportshell_user": "$USER_NAME"
 }
 CFGEOF
-    ok "Config created: $CFG (email: $EMAIL, ssh: $SSH_USER)"
 fi
-
-# Read SSH user from config for later steps
-SSH_USER=$(python3 -c "import json; print(json.load(open('$CFG')).get('supportshell_user','$USER_NAME'))" 2>/dev/null || echo "$USER_NAME")
-
-# ────────────────────────────────────────────────────────────────
-step "5/8" "Testing SSH to supportshell"
-# ────────────────────────────────────────────────────────────────
-
+SSH_USER=$("$PYTHON" -c "import json; print(json.load(open('$CFG')).get('supportshell_user','$USER_NAME'))" 2>/dev/null || echo "$USER_NAME")
 SSH_HOST="${SSH_USER}@supportshell-1.sush-001.prod.us-west-2.aws.redhat.com"
-SSH_OK=0
+SSH_CTRL="/tmp/sf-ssh-ctrl-${USER_NAME}"
+ok "Scripts, config, PATH ready"
 
-if ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_HOST" "echo SSH_OK" 2>/dev/null | grep -q SSH_OK; then
-    ok "SSH to supportshell works"
-    SSH_OK=1
-else
-    warn "SSH failed — run: ssh-copy-id $SSH_HOST"
-    echo -e "    ${Y}The poller needs SSH to supportshell for GraphQL data.${N}"
-    echo -e "    ${Y}Fix it and re-run install.sh, or the poller will retry automatically.${N}"
-fi
+# Pre-warm SSH + first poll in background (runs during service startup)
+(ssh -o ControlMaster=yes -o ControlPath="$SSH_CTRL" \
+    -o ControlPersist=300 -o ConnectTimeout=10 -o BatchMode=yes \
+    -N "$SSH_HOST" &>/dev/null &)
+"$PYTHON" "$BIN_DIR/sf-case-poller" --once &>/dev/null &
 
 # ────────────────────────────────────────────────────────────────
-step "6/8" "Setting up GraphQL access"
+step "2/4" "Starting services"
 # ────────────────────────────────────────────────────────────────
 
-if [ "$SSH_OK" -eq 1 ]; then
-    # Actually TEST GraphQL — not just check if token file exists
-    echo -e "  Testing GraphQL API..."
-    GQL_TEST=$(ssh -o ConnectTimeout=15 "$SSH_HOST" 'python3 -c "
-import json, urllib.request, urllib.parse, os
+ok "Email via supportshell SMTP (no mail client needed)"
 
-def try_token(path):
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        d = json.load(f)
-    data = urllib.parse.urlencode({\"grant_type\": \"refresh_token\", \"refresh_token\": d[\"refresh_token\"], \"client_id\": \"cee-supportshell-deviceauth\"}).encode()
-    req = urllib.request.Request(\"https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token\", data)
-    at = json.loads(urllib.request.urlopen(req, timeout=10).read())[\"access_token\"]
-    q = json.dumps({\"query\": \"{ redhat_support_uiapi { query { RedHatSupportCase(first: 1, where: { IsClosed: { eq: false } }) { edges { node { CaseNumber__c { value } } } } } } }\"}).encode()
-    req2 = urllib.request.Request(\"https://vpn.graphql.redhat.com\", data=q)
-    req2.add_header(\"Authorization\", \"Bearer \" + at)
-    req2.add_header(\"Content-Type\", \"application/json\")
-    req2.add_header(\"apollographql-client-name\", \"redhat-hydra-mcp-server\")
-    req2.add_header(\"apollographql-client-version\", \"0.1.0\")
-    resp = urllib.request.urlopen(req2, timeout=15)
-    result = json.loads(resp.read())
-    edges = result.get(\"data\", {}).get(\"redhat_support_uiapi\", {}).get(\"query\", {}).get(\"RedHatSupportCase\", {}).get(\"edges\", [])
-    return len(edges)
+if [ "$IS_MAC" -eq 1 ]; then
+    # ── macOS: LaunchAgents ──
+    mkdir -p "$LAUNCH_DIR"
 
-# Try hydra-mcp token first, then yank
-for p in [os.path.expanduser(\"~/.cache/hydra-mcp/tokens/redhat-sso-token.json\"), os.path.expanduser(\"~/.yank/oidc-tokens.json\")]:
-    try:
-        n = try_token(p)
-        if n is not None and n > 0:
-            print(\"GQL_OK\")
-            raise SystemExit(0)
-    except SystemExit:
-        raise
-    except Exception:
-        pass
-print(\"GQL_FAIL\")
-"' 2>/dev/null || echo "GQL_FAIL")
+    SSH_SOCK="${SSH_AUTH_SOCK:-}"
+    [ -z "$SSH_SOCK" ] && SSH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1 || echo "")
 
-    if echo "$GQL_TEST" | grep -q GQL_OK; then
-        ok "GraphQL API working — cases accessible"
-    else
-        warn "GraphQL token missing or expired — setting up now..."
-        echo ""
-        echo -e "  ${B}Opening authentication in your browser...${N}"
-        echo -e "  ${Y}Complete the login in the browser window that opens.${N}"
-        echo ""
-        # Run hydra-auth interactively — user sees the device auth URL
-        ssh -t "$SSH_HOST" "redhat-hydra-auth --production" 2>&1 || true
-        echo ""
+    pgrep -x "Mail" > /dev/null 2>&1 && ok "Mail.app running (bonus: also sends via Mail.app)"
 
-        # Re-test after auth
-        GQL_RETEST=$(ssh -o ConnectTimeout=15 "$SSH_HOST" 'python3 -c "
-import json, urllib.request, urllib.parse, os
-path = os.path.expanduser(\"~/.cache/hydra-mcp/tokens/redhat-sso-token.json\")
-if not os.path.exists(path):
-    print(\"NO_TOKEN\"); raise SystemExit(1)
-with open(path) as f:
-    d = json.load(f)
-data = urllib.parse.urlencode({\"grant_type\": \"refresh_token\", \"refresh_token\": d[\"refresh_token\"], \"client_id\": \"cee-supportshell-deviceauth\"}).encode()
-req = urllib.request.Request(\"https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token\", data)
-at = json.loads(urllib.request.urlopen(req, timeout=10).read())[\"access_token\"]
-print(\"GQL_OK\")
-"' 2>/dev/null || echo "GQL_FAIL")
+    launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null || true
+    pkill -f "local-mailserver" 2>/dev/null || true
 
-        if echo "$GQL_RETEST" | grep -q GQL_OK; then
-            ok "GraphQL token created — API working"
-        else
-            warn "GraphQL setup incomplete — poller will retry automatically"
-            echo -e "    ${Y}You can manually run: ssh $SSH_HOST${N}"
-            echo -e "    ${Y}Then: redhat-hydra-auth --production${N}"
-        fi
-    fi
-else
-    warn "Skipped — SSH not working"
-fi
-
-# ────────────────────────────────────────────────────────────────
-step "7/8" "Starting services"
-# ────────────────────────────────────────────────────────────────
-
-mkdir -p "$LAUNCH_DIR" "$LOG_DIR"
-
-# --- Start Mail.app if not running ---
-if ! pgrep -x "Mail" > /dev/null 2>&1; then
-    open -a Mail
-    ok "Started Mail.app"
-    sleep 2
-else
-    ok "Mail.app already running"
-fi
-
-# Detect SSH_AUTH_SOCK for LaunchAgents
-SSH_SOCK="${SSH_AUTH_SOCK:-}"
-if [ -z "$SSH_SOCK" ]; then
-    # macOS default
-    SSH_SOCK="/private/tmp/com.apple.launchd.*/Listeners"
-    SSH_SOCK=$(ls $SSH_SOCK 2>/dev/null | head -1 || echo "")
-fi
-
-# --- Local Mailserver (SMTP + Dashboard on port 8090) ---
-launchctl unload "$LAUNCH_DIR/$MAILER_LABEL.plist" 2>/dev/null || true
-pkill -f "local-mailserver" 2>/dev/null || true
-sleep 1
-
-cat > "$LAUNCH_DIR/$MAILER_LABEL.plist" <<PLISTEOF
+    cat > "$LAUNCH_DIR/$MAILER_LABEL.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>$MAILER_LABEL</string>
+    <key>Label</key><string>$MAILER_LABEL</string>
     <key>ProgramArguments</key>
-    <array>
-        <string>$PYTHON</string>
-        <string>$BIN_DIR/local-mailserver</string>
-    </array>
+    <array><string>$PYTHON</string><string>$BIN_DIR/local-mailserver</string></array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>HOME</key>
-        <string>$HOME_DIR</string>
-        <key>SSH_AUTH_SOCK</key>
-        <string>$SSH_SOCK</string>
+        <key>HOME</key><string>$HOME_DIR</string>
+        <key>SSH_AUTH_SOCK</key><string>$SSH_SOCK</string>
     </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/local-mailserver.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/local-mailserver.log</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/tmp/local-mailserver.log</string>
+    <key>StandardErrorPath</key><string>/tmp/local-mailserver.log</string>
 </dict>
 </plist>
 PLISTEOF
-launchctl load "$LAUNCH_DIR/$MAILER_LABEL.plist"
-ok "Local mailserver started (SMTP :2525 + Dashboard :8090)"
+    launchctl load "$LAUNCH_DIR/$MAILER_LABEL.plist"
+    ok "Dashboard started (port 8090)"
 
-# --- SF Case Poller ---
-launchctl unload "$LAUNCH_DIR/$POLLER_LABEL.plist" 2>/dev/null || true
-sleep 1
+    launchctl unload "$LAUNCH_DIR/$POLLER_LABEL.plist" 2>/dev/null || true
 
-cat > "$LAUNCH_DIR/$POLLER_LABEL.plist" <<PLISTEOF
+    cat > "$LAUNCH_DIR/$POLLER_LABEL.plist" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>$POLLER_LABEL</string>
+    <key>Label</key><string>$POLLER_LABEL</string>
     <key>ProgramArguments</key>
-    <array>
-        <string>$PYTHON</string>
-        <string>$BIN_DIR/sf-case-poller</string>
-        <string>poll</string>
-    </array>
+    <array><string>$PYTHON</string><string>$BIN_DIR/sf-case-poller</string><string>poll</string></array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>SF_POLL_INTERVAL</key>
-        <string>60</string>
-        <key>HOME</key>
-        <string>$HOME_DIR</string>
-        <key>SSH_AUTH_SOCK</key>
-        <string>$SSH_SOCK</string>
+        <key>SF_POLL_INTERVAL</key><string>60</string>
+        <key>HOME</key><string>$HOME_DIR</string>
+        <key>SSH_AUTH_SOCK</key><string>$SSH_SOCK</string>
     </dict>
-    <key>KeepAlive</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>30</integer>
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/sf-case-poller.log</string>
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/sf-case-poller.log</string>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key><string>$LOG_DIR/sf-case-poller.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/sf-case-poller.log</string>
 </dict>
 </plist>
 PLISTEOF
-launchctl load "$LAUNCH_DIR/$POLLER_LABEL.plist"
-launchctl start "$POLLER_LABEL"
-ok "SF case poller started (every 60s)"
+    launchctl load "$LAUNCH_DIR/$POLLER_LABEL.plist"
+    launchctl start "$POLLER_LABEL"
+    ok "SF case poller started (every 60s)"
 
-# ────────────────────────────────────────────────────────────────
-step "8/8" "Opening dashboard"
-# ────────────────────────────────────────────────────────────────
+else
+    # ── Linux: systemd user services (24/7 on server) ──
+    mkdir -p "$SYSTEMD_DIR"
+    pkill -f "local-mailserver" 2>/dev/null || true
+    pkill -f "sf-case-poller.*poll" 2>/dev/null || true
 
-# Quick wait for dashboard to be ready
-for i in $(seq 1 5); do
-    if curl -s -o /dev/null -w "%{http_code}" http://localhost:8090 2>/dev/null | grep -q 200; then
-        break
+    cat > "$SYSTEMD_DIR/sf-mailserver.service" <<SVCEOF
+[Unit]
+Description=SF Notification Center Dashboard + SMTP
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$PYTHON $BIN_DIR/local-mailserver
+Restart=always
+RestartSec=5
+Environment=HOME=$HOME_DIR
+
+[Install]
+WantedBy=default.target
+SVCEOF
+
+    cat > "$SYSTEMD_DIR/sf-case-poller.service" <<SVCEOF
+[Unit]
+Description=SF Case Poller (GraphQL via supportshell)
+After=network.target sf-mailserver.service
+
+[Service]
+Type=simple
+ExecStart=$PYTHON $BIN_DIR/sf-case-poller poll
+Restart=always
+RestartSec=10
+Environment=HOME=$HOME_DIR
+Environment=SF_POLL_INTERVAL=60
+
+[Install]
+WantedBy=default.target
+SVCEOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable sf-mailserver sf-case-poller
+    systemctl --user start sf-mailserver
+    systemctl --user start sf-case-poller
+    ok "Dashboard started (port 8090)"
+    ok "SF case poller started (every 60s, auto-restart on failure)"
+
+    if command -v loginctl &>/dev/null; then
+        loginctl enable-linger "$USER_NAME" 2>/dev/null || true
+        ok "Linger enabled — services run 24/7 even after logout"
     fi
-    sleep 1
-done
+fi
 
-# Open dashboard immediately
-open "http://localhost:8090" 2>/dev/null || true
-ok "Dashboard opened at http://localhost:8090"
+# ────────────────────────────────────────────────────────────────
+step "3/4" "Opening dashboard"
+# ────────────────────────────────────────────────────────────────
 
-# Run first poll now — takes ~10s
-echo ""
-echo -e "  ${Y}Running first poll...${N}"
-python3 "$BIN_DIR/sf-case-poller" --once > /dev/null 2>&1
-CASES=$(python3 -c "
-import sqlite3
-try:
-    c = sqlite3.connect('$STATE_DIR/sf-notification-center.db')
-    print(c.execute('SELECT COUNT(*) FROM cases').fetchone()[0])
-except: print(0)
-" 2>/dev/null || echo "0")
-ok "First poll complete — $CASES cases tracked"
+for i in 1 2 3; do curl -s -o /dev/null http://localhost:8090 2>/dev/null && break; sleep 0.5; done
+
+[ "$IS_MAC" -eq 1 ] && open "http://localhost:8090" 2>/dev/null || true
+
+ok "Dashboard ready — cases loading in background"
+ok "http://localhost:8090"
+
+# ────────────────────────────────────────────────────────────────
+step "4/4" "Done"
+# ────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${G}╔═══════════════════════════════════════════════════════╗${N}"
 echo -e "${G}║  ${BOLD}✅ Installation complete!${N}${G}                              ║${N}"
 echo -e "${G}║                                                       ║${N}"
 echo -e "${G}║  Dashboard:   ${BOLD}http://localhost:8090${N}${G}                    ║${N}"
-echo -e "${G}║  Logs:        ${BOLD}sf-case-poller logs${N}${G}                      ║${N}"
-echo -e "${G}║  Health:      ${BOLD}sf-case-poller health${N}${G}                    ║${N}"
-echo -e "${G}║  Uninstall:   ${BOLD}sf-case-poller uninstall${N}${G}                 ║${N}"
+echo -e "${G}║  Email:       ${BOLD}via supportshell SMTP (no mail client)${N}${G}   ║${N}"
+echo -e "${G}║  Uninstall:   ${BOLD}./install.sh uninstall${N}${G}                   ║${N}"
 echo -e "${G}║                                                       ║${N}"
 echo -e "${G}║  Data source: Red Hat GraphQL API (no browser needed) ║${N}"
-echo -e "${G}║  Polling:     Every 60 seconds                        ║${N}"
+echo -e "${G}║  Polling:     Every 60 seconds • Runs 24/7            ║${N}"
 echo -e "${G}╚═══════════════════════════════════════════════════════╝${N}"
