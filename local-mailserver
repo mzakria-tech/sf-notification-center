@@ -478,8 +478,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="footer">SF Notification Center &bull; Red Hat Support</div>
 <script>
 
-}
-
 function addTrackedCase(btn) {
     var inp = document.getElementById('new-case-input');
     var cn = inp.value.trim();
