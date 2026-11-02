@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /Users/mzakria/sf-notification-center && (./restart.sh || ./start.sh) 2>/dev/null &",
+            "statusMessage": "Restarting local project...",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

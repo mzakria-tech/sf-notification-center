@@ -829,9 +829,9 @@ def _render(data: dict) -> str:
                 f'<div style="display:flex;align-items:center;gap:10px;background:#0f172a;padding:8px 12px;'
                 f'border-radius:6px;margin-bottom:6px;border-left:3px solid #10b981">'
                 f'<span style="flex:1;color:#cbd5e1;font-weight:600">{cn}</span>'
-                f'<button class="config-save" style="padding:4px 12px;font-size:11px;'
-                f'background:linear-gradient(135deg,#ef4444,#dc2626)" '
-                f'onclick="removeFtsCase(\'{cn}\', this)">Remove</button></div>'
+                f'<button class="config-save" style="padding:4px 8px;font-size:16px;min-width:auto;'
+                f'background:linear-gradient(135deg,#ef4444,#dc2626);color:white;border:none;cursor:pointer;" '
+                f'onclick="removeFtsCase(\'{cn}\', this)" title="Stop tracking this case">✕</button></div>'
             )
     if not fts_tracked_html:
         fts_tracked_html = '<div style="color:#475569;font-size:12px;padding:8px">No FTS cases tracked yet</div>'
