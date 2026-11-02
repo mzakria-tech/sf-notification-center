@@ -1035,15 +1035,30 @@ class WebHandler(BaseHTTPRequestHandler):
 
             if action == "add" and case_num:
                 if case_num not in fts_tracked:
-                    fts_tracked.append(case_num)
-                    cfg["fts_tracked_cases"] = fts_tracked
-                    _save_config(cfg)
-                    result = {"ok": True, "msg": f"FTS Case {case_num} added for tracking", "fts_tracked": fts_tracked}
-                    _watchdog_log(f"✓ FTS Case {case_num} added to tracking list")
-                    # Trigger immediate poll
-                    py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
-                    subprocess.Popen([py, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Validate case exists in Salesforce database
+                    try:
+                        import sqlite3
+                        db = sqlite3.connect(os.path.expanduser("~/.local/state/sf-notification-center.db"))
+                        db.row_factory = sqlite3.Row
+                        case_exists = db.execute(
+                            "SELECT case_id FROM cases WHERE case_number=?", (case_num,)
+                        ).fetchone()
+                        db.close()
+
+                        if not case_exists:
+                            result = {"ok": False, "msg": f"Case {case_num} not found in Salesforce. Please enter a valid case number."}
+                        else:
+                            fts_tracked.append(case_num)
+                            cfg["fts_tracked_cases"] = fts_tracked
+                            _save_config(cfg)
+                            result = {"ok": True, "msg": f"FTS Case {case_num} added for tracking", "fts_tracked": fts_tracked}
+                            _watchdog_log(f"✓ FTS Case {case_num} added to tracking list")
+                            # Trigger immediate poll
+                            py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
+                            subprocess.Popen([py, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception as e:
+                        result = {"ok": False, "msg": f"Error validating case: {str(e)[:100]}"}
                 else:
                     result = {"ok": False, "msg": f"FTS Case {case_num} already tracked"}
 
@@ -1083,15 +1098,30 @@ class WebHandler(BaseHTTPRequestHandler):
 
             if action == "add" and case_num:
                 if case_num not in tracked:
-                    tracked.append(case_num)
-                    cfg["tracked_cases"] = tracked
-                    _save_config(cfg)
-                    result = {"ok": True, "msg": f"Case {case_num} added for tracking", "tracked": tracked}
-                    _watchdog_log(f"✓ Case {case_num} added to tracking list")
-                    # Trigger immediate poll
-                    py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
-                    subprocess.Popen([py, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Validate case exists in Salesforce database
+                    try:
+                        import sqlite3
+                        db = sqlite3.connect(os.path.expanduser("~/.local/state/sf-notification-center.db"))
+                        db.row_factory = sqlite3.Row
+                        case_exists = db.execute(
+                            "SELECT case_id FROM cases WHERE case_number=?", (case_num,)
+                        ).fetchone()
+                        db.close()
+
+                        if not case_exists:
+                            result = {"ok": False, "msg": f"Case {case_num} not found in Salesforce. Please enter a valid case number."}
+                        else:
+                            tracked.append(case_num)
+                            cfg["tracked_cases"] = tracked
+                            _save_config(cfg)
+                            result = {"ok": True, "msg": f"Case {case_num} added for tracking", "tracked": tracked}
+                            _watchdog_log(f"✓ Case {case_num} added to tracking list")
+                            # Trigger immediate poll
+                            py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
+                            subprocess.Popen([py, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception as e:
+                        result = {"ok": False, "msg": f"Error validating case: {str(e)[:100]}"}
                 else:
                     result = {"ok": False, "msg": f"Case {case_num} already tracked"}
 
