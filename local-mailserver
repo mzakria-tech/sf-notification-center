@@ -135,6 +135,44 @@ def _last_log_lines(n=5) -> list[str]:
         return []
 
 
+def _get_fts_tracked_cases_status() -> list[dict]:
+    """Get status of FTS tracked cases from database."""
+    try:
+        import sqlite3
+        db = sqlite3.connect(os.path.expanduser("~/.local/state/sf-notification-center.db"))
+        db.row_factory = sqlite3.Row
+        cfg = _read_config()
+        fts_tracked = cfg.get("fts_tracked_cases", [])
+
+        result = []
+        for case_num in fts_tracked:
+            row = db.execute(
+                "SELECT case_id, case_number, status, subject, comment_count, last_seen FROM cases WHERE case_number=?",
+                (case_num,)
+            ).fetchone()
+            if row:
+                result.append({
+                    "number": row["case_number"],
+                    "status": row["status"],
+                    "subject": row["subject"][:60] if row["subject"] else "N/A",
+                    "comments": row["comment_count"] or 0,
+                    "last_seen": row["last_seen"][:10] if row["last_seen"] else "N/A",
+                    "id": row["case_id"]
+                })
+            else:
+                result.append({
+                    "number": case_num,
+                    "status": "Pending discovery",
+                    "subject": "N/A",
+                    "comments": 0,
+                    "last_seen": "N/A",
+                    "id": ""
+                })
+        db.close()
+        return result
+    except Exception as e:
+        return []
+
 def _get_status_data() -> dict:
     """Gather all live status data."""
     poller = _check_service("poller")
@@ -161,6 +199,7 @@ def _get_status_data() -> dict:
     view_url = cfg.get("case_list_url", "")
     tracked_cases = cfg.get("tracked_cases", [])
     fts_tracked_cases = cfg.get("fts_tracked_cases", [])
+    fts_tracked_status = _get_fts_tracked_cases_status()
 
     return {
         "poller": poller,
@@ -182,6 +221,7 @@ def _get_status_data() -> dict:
         "watchdog_log": list(WATCHDOG_LOG),
         "tracked_cases": tracked_cases,
         "fts_tracked_cases": fts_tracked_cases,
+        "fts_tracked_status": fts_tracked_status,
     }
 
 
@@ -419,6 +459,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="config-save" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="addFtsCase(this)">+ Add FTS Case</button>
   </div>
   <div id="fts-tracked-list" style="margin-top:12px"></div>
+</div>
+
+<div class="section-title"><span class="icon">📊</span> FTS Tracked Cases Status</div>
+<div style="margin-bottom:22px">
+  {fts_status_html}
 </div>
 
 <div class="section-title" style="margin-top:22px"><span class="icon">📜</span> Activity Log</div>
@@ -796,6 +841,26 @@ def _render(data: dict) -> str:
         f'<div id="fts-tracked-list-js">{fts_tracked_html}</div>'
     )
 
+    # FTS Tracked cases status
+    fts_status = data.get("fts_tracked_status", [])
+    fts_status_html = ""
+    if fts_status:
+        fts_status_html = '<table class="case-table"><thead><tr><th>Case #</th><th>Status</th><th>Subject</th><th>Comments</th><th>Last Seen</th></tr></thead><tbody>'
+        for case in fts_status:
+            link = f'https://redhatsupport.lightning.force.com/lightning/r/Case/{case["id"]}/view' if case["id"] else '#'
+            fts_status_html += (
+                f'<tr>'
+                f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{case["number"]}</span></a></td>'
+                f'<td>{_status_pill(case["status"])}</td>'
+                f'<td style="color:#e2e8f0">{case["subject"][:50]}</td>'
+                f'<td style="text-align:center;color:#60a5fa">{case["comments"]}</td>'
+                f'<td style="font-size:11px;color:#94a3b8">{case["last_seen"]}</td>'
+                f'</tr>'
+            )
+        fts_status_html += '</tbody></table>'
+    else:
+        fts_status_html = '<div class="empty"><div class="empty-icon">📭</div>No FTS cases being tracked</div>'
+
     html = DASHBOARD
     replacements = {
         "{ms_cls}": ms_cls, "{ms_text}": ms_text, "{ms_fix}": ms_fix,
@@ -815,6 +880,7 @@ def _render(data: dict) -> str:
         "{notify_email}": data.get("notify_email", "not configured"),
         "{tracked_list_html}": tracked_list_html,
         "{fts_tracked_list_html}": fts_tracked_list_html,
+        "{fts_status_html}": fts_status_html,
     }
     for k, v in replacements.items():
         html = html.replace(k, v)
