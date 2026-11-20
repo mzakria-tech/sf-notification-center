@@ -36,7 +36,7 @@ SMTP_ENABLED = False
 # Embedded heal command (same as sf-case-poller / update.sh) — shown on dashboard when GraphQL fails
 HEAL_CMD = (
     os.environ.get("SF_NOTIFY_HEAL_CMD")
-    or "cd ~/Desktop/sf-notification-center && ./update.sh"
+    or "cd ~/sf-notification-center && ./update.sh"
 ).strip()
 
 
@@ -135,44 +135,6 @@ def _last_log_lines(n=5) -> list[str]:
         return []
 
 
-def _get_fts_tracked_cases_status() -> list[dict]:
-    """Get status of FTS tracked cases from database."""
-    try:
-        import sqlite3
-        db = sqlite3.connect(os.path.expanduser("~/.local/state/sf-notification-center.db"))
-        db.row_factory = sqlite3.Row
-        cfg = _read_config()
-        fts_tracked = cfg.get("fts_tracked_cases", [])
-
-        result = []
-        for case_num in fts_tracked:
-            row = db.execute(
-                "SELECT case_id, case_number, status, subject, comment_count, last_seen FROM cases WHERE case_number=?",
-                (case_num,)
-            ).fetchone()
-            if row:
-                result.append({
-                    "number": row["case_number"],
-                    "status": row["status"],
-                    "subject": row["subject"][:60] if row["subject"] else "N/A",
-                    "comments": row["comment_count"] or 0,
-                    "last_seen": row["last_seen"][:10] if row["last_seen"] else "N/A",
-                    "id": row["case_id"]
-                })
-            else:
-                result.append({
-                    "number": case_num,
-                    "status": "Pending discovery",
-                    "subject": "N/A",
-                    "comments": 0,
-                    "last_seen": "N/A",
-                    "id": ""
-                })
-        db.close()
-        return result
-    except Exception as e:
-        return []
-
 def _get_status_data() -> dict:
     """Gather all live status data."""
     poller = _check_service("poller")
@@ -197,9 +159,6 @@ def _get_status_data() -> dict:
 
     cfg = _read_config()
     view_url = cfg.get("case_list_url", "")
-    tracked_cases = cfg.get("tracked_cases", [])
-    fts_tracked_cases = cfg.get("fts_tracked_cases", [])
-    fts_tracked_status = _get_fts_tracked_cases_status()
 
     return {
         "poller": poller,
@@ -219,9 +178,6 @@ def _get_status_data() -> dict:
         "case_list_url": view_url,
         "notify_email": cfg.get("notify_email", os.environ.get("SF_NOTIFY_EMAIL", "not configured")),
         "watchdog_log": list(WATCHDOG_LOG),
-        "tracked_cases": tracked_cases,
-        "fts_tracked_cases": fts_tracked_cases,
-        "fts_tracked_status": fts_tracked_status,
     }
 
 
@@ -441,31 +397,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="log-box">{watchdog_html}</div>
 
 <!-- Activity Log -->
-<div class="section-title"><span class="icon">📌</span> Track Additional Cases</div>
-<div class="config-card" style="border:1px solid #8b5cf6">
-  <div style="font-size:13px;color:#cbd5e1;margin-bottom:10px">Add case numbers you want to monitor for updates (even if not assigned to you):</div>
-  <div class="config-row">
-    <input type="text" id="new-case-input" class="config-input" placeholder="e.g., 12345 or 045012345" maxlength="10">
-    <button class="config-save" onclick="addTrackedCase(this)">+ Add Case</button>
-  </div>
-  <div id="tracked-list" style="margin-top:12px"></div>
-</div>
-
-<div class="section-title" style="margin-top:22px"><span class="icon">🔧</span> FTS Tracked Cases</div>
-<div class="config-card" style="border:1px solid #10b981">
-  <div style="font-size:13px;color:#cbd5e1;margin-bottom:10px">Field Technical Support cases for monitoring and updates:</div>
-  <div class="config-row">
-    <input type="text" id="new-fts-case-input" class="config-input" placeholder="e.g., 12345 or 045012345" maxlength="10">
-    <button class="config-save" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="addFtsCase(this)">+ Add FTS Case</button>
-  </div>
-  <div id="fts-tracked-list" style="margin-top:12px"></div>
-</div>
-
-<div class="section-title"><span class="icon">📊</span> FTS Tracked Cases Status</div>
-<div style="margin-bottom:22px">
-  {fts_status_html}
-</div>
-
 <div class="section-title" style="margin-top:22px"><span class="icon">📜</span> Activity Log</div>
 <div class="log-box">{log_html}</div>
 
@@ -478,132 +409,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="footer">SF Notification Center &bull; Red Hat Support</div>
 <script>
 
-function addTrackedCase(btn) {
-    var inp = document.getElementById('new-case-input');
-    var cn = inp.value.trim();
-    if (!cn) {
-        alert('Enter a case number');
-        return;
-    }
-    if (!/^\d{5,10}$/.test(cn)) {
-        alert('Case number should be 5-10 digits (e.g., 12345 or 045012345)');
-        return;
-    }
-    btn.textContent = '⏳ Adding...';
-    btn.disabled = true;
-    fetch('/api/tracked-cases', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: 'add', case: cn})
-    })
-    .then(r => r.json())
-    .then(d => {
-        if (d.ok) {
-            inp.value = '';
-            btn.textContent = '✓ Added';
-            btn.style.background = '#22c55e';
-            setTimeout(() => location.reload(), 1500);
-        } else {
-            btn.textContent = '✗ ' + (d.msg || 'Failed');
-            btn.style.background = '#ef4444';
-            setTimeout(() => { btn.textContent = '+ Add Case'; btn.style.background = ''; btn.disabled = false; }, 3000);
-        }
-    })
-    .catch(() => {
-        btn.textContent = '✗ Network error';
-        btn.style.background = '#ef4444';
-        setTimeout(() => { btn.textContent = '+ Add Case'; btn.style.background = ''; btn.disabled = false; }, 3000);
-    });
-}
-
-function removeTrackedCase(cn, btn) {
-    if (!confirm('Stop tracking case ' + cn + '?')) return;
-    btn.textContent = '⏳ Removing...';
-    btn.disabled = true;
-    fetch('/api/tracked-cases', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: 'remove', case: cn})
-    })
-    .then(r => r.json())
-    .then(d => {
-        if (d.ok) {
-            btn.textContent = '✓ Removed';
-            setTimeout(() => location.reload(), 1500);
-        } else {
-            btn.textContent = '✗ Failed';
-            btn.disabled = false;
-            setTimeout(() => location.reload(), 2000);
-        }
-    })
-    .catch(() => {
-        btn.textContent = '✗ Error';
-        setTimeout(() => location.reload(), 2000);
-    });
-}
-
-function addFtsCase(btn) {
-    var inp = document.getElementById('new-fts-case-input');
-    var cn = inp.value.trim();
-    if (!cn) {
-        alert('Enter a case number');
-        return;
-    }
-    if (!/^\\d{5,10}$/.test(cn)) {
-        alert('Case number should be 5-10 digits (e.g., 12345 or 045012345)');
-        return;
-    }
-    btn.textContent = '⏳ Adding...';
-    btn.disabled = true;
-    fetch('/api/fts-tracked-cases', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: 'add', case: cn})
-    })
-    .then(r => r.json())
-    .then(d => {
-        if (d.ok) {
-            inp.value = '';
-            btn.textContent = '✓ Added';
-            btn.style.background = '#22c55e';
-            setTimeout(() => location.reload(), 1500);
-        } else {
-            btn.textContent = '✗ ' + (d.msg || 'Failed');
-            btn.style.background = '#ef4444';
-            setTimeout(() => { btn.textContent = '+ Add FTS Case'; btn.style.background = ''; btn.disabled = false; }, 3000);
-        }
-    })
-    .catch(() => {
-        btn.textContent = '✗ Network error';
-        btn.style.background = '#ef4444';
-        setTimeout(() => { btn.textContent = '+ Add FTS Case'; btn.style.background = ''; btn.disabled = false; }, 3000);
-    });
-}
-
-function removeFtsCase(cn, btn) {
-    if (!confirm('Stop tracking FTS case ' + cn + '?')) return;
-    btn.textContent = '⏳ Removing...';
-    btn.disabled = true;
-    fetch('/api/fts-tracked-cases', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({action: 'remove', case: cn})
-    })
-    .then(r => r.json())
-    .then(d => {
-        if (d.ok) {
-            btn.textContent = '✓ Removed';
-            setTimeout(() => location.reload(), 1500);
-        } else {
-            btn.textContent = '✗ Failed';
-            btn.disabled = false;
-            setTimeout(() => location.reload(), 2000);
-        }
-    })
-    .catch(() => {
-        btn.textContent = '✗ Error';
-        setTimeout(() => location.reload(), 2000);
-    });
 }
 
 function startService(svc, btn) {
@@ -801,64 +606,6 @@ def _render(data: dict) -> str:
     scrape_map = {"success": "✅ last scrape OK", "failed": "❌ last scrape failed", "unknown": "⏳ pending"}
     scrape_text = scrape_map.get(scrape, scrape)
 
-    # Tracked cases list
-    tracked_cases = data.get("tracked_cases", [])
-    tracked_html = ""
-    if tracked_cases:
-        for cn in tracked_cases:
-            tracked_html += (
-                f'<div style="display:flex;align-items:center;gap:10px;background:#0f172a;padding:8px 12px;'
-                f'border-radius:6px;margin-bottom:6px;border-left:3px solid #8b5cf6">'
-                f'<span style="flex:1;color:#cbd5e1;font-weight:600">{cn}</span>'
-                f'<button class="config-save" style="padding:4px 12px;font-size:11px;'
-                f'background:linear-gradient(135deg,#ef4444,#dc2626)" '
-                f'onclick="removeTrackedCase(\'{cn}\', this)">Remove</button></div>'
-            )
-    if not tracked_html:
-        tracked_html = '<div style="color:#475569;font-size:12px;padding:8px">No additional cases tracked yet</div>'
-    tracked_list_html = (
-        f'<div id="tracked-list-js">{tracked_html}</div>'
-    )
-
-    # FTS Tracked cases list
-    fts_tracked_cases = data.get("fts_tracked_cases", [])
-    fts_tracked_html = ""
-    if fts_tracked_cases:
-        for cn in fts_tracked_cases:
-            fts_tracked_html += (
-                f'<div style="display:flex;align-items:center;gap:10px;background:#0f172a;padding:8px 12px;'
-                f'border-radius:6px;margin-bottom:6px;border-left:3px solid #10b981">'
-                f'<span style="flex:1;color:#cbd5e1;font-weight:600">{cn}</span>'
-                f'<button class="config-save" style="padding:4px 8px;font-size:16px;min-width:auto;'
-                f'background:linear-gradient(135deg,#ef4444,#dc2626);color:white;border:none;cursor:pointer;" '
-                f'onclick="removeFtsCase(\'{cn}\', this)" title="Stop tracking this case">✕</button></div>'
-            )
-    if not fts_tracked_html:
-        fts_tracked_html = '<div style="color:#475569;font-size:12px;padding:8px">No FTS cases tracked yet</div>'
-    fts_tracked_list_html = (
-        f'<div id="fts-tracked-list-js">{fts_tracked_html}</div>'
-    )
-
-    # FTS Tracked cases status
-    fts_status = data.get("fts_tracked_status", [])
-    fts_status_html = ""
-    if fts_status:
-        fts_status_html = '<table class="case-table"><thead><tr><th>Case #</th><th>Status</th><th>Subject</th><th>Comments</th><th>Last Seen</th></tr></thead><tbody>'
-        for case in fts_status:
-            link = f'https://redhatsupport.lightning.force.com/lightning/r/Case/{case["id"]}/view' if case["id"] else '#'
-            fts_status_html += (
-                f'<tr>'
-                f'<td><a class="case-link" href="{link}" target="_blank"><span class="case-num">{case["number"]}</span></a></td>'
-                f'<td>{_status_pill(case["status"])}</td>'
-                f'<td style="color:#e2e8f0">{case["subject"][:50]}</td>'
-                f'<td style="text-align:center;color:#60a5fa">{case["comments"]}</td>'
-                f'<td style="font-size:11px;color:#94a3b8">{case["last_seen"]}</td>'
-                f'</tr>'
-            )
-        fts_status_html += '</tbody></table>'
-    else:
-        fts_status_html = '<div class="empty"><div class="empty-icon">📭</div>No FTS cases being tracked</div>'
-
     html = DASHBOARD
     replacements = {
         "{ms_cls}": ms_cls, "{ms_text}": ms_text, "{ms_fix}": ms_fix,
@@ -876,9 +623,6 @@ def _render(data: dict) -> str:
         "{watchdog_html}": _render_watchdog(data.get("watchdog_log", [])),
         "{case_list_url}": data.get("case_list_url", ""),
         "{notify_email}": data.get("notify_email", "not configured"),
-        "{tracked_list_html}": tracked_list_html,
-        "{fts_tracked_list_html}": fts_tracked_list_html,
-        "{fts_status_html}": fts_status_html,
     }
     for k, v in replacements.items():
         html = html.replace(k, v)
@@ -1010,132 +754,6 @@ class WebHandler(BaseHTTPRequestHandler):
                 result = {"ok": True, "msg": "Saved & poller restarted"}
             else:
                 result = {"ok": False, "msg": "Invalid URL"}
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
-            return
-
-        if self.path == "/api/fts-tracked-cases":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode() if length else ""
-            try:
-                req = json.loads(body)
-            except Exception:
-                req = {}
-
-            action = req.get("action", "")
-            case_num = req.get("case", "").strip()
-
-            cfg = _read_config()
-            fts_tracked = cfg.get("fts_tracked_cases", [])
-            result = {"ok": False, "msg": "unknown action"}
-
-            if action == "add" and case_num:
-                if case_num not in fts_tracked:
-                    # Validate case exists in Salesforce database
-                    try:
-                        import sqlite3
-                        db = sqlite3.connect(os.path.expanduser("~/.local/state/sf-notification-center.db"))
-                        db.row_factory = sqlite3.Row
-                        case_exists = db.execute(
-                            "SELECT case_id FROM cases WHERE case_number=?", (case_num,)
-                        ).fetchone()
-                        db.close()
-
-                        if not case_exists:
-                            result = {"ok": False, "msg": f"Case {case_num} not found in Salesforce. Please enter a valid case number."}
-                        else:
-                            fts_tracked.append(case_num)
-                            cfg["fts_tracked_cases"] = fts_tracked
-                            _save_config(cfg)
-                            result = {"ok": True, "msg": f"FTS Case {case_num} added for tracking", "fts_tracked": fts_tracked}
-                            _watchdog_log(f"✓ FTS Case {case_num} added to tracking list")
-                            # Trigger immediate poll
-                            py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
-                            subprocess.Popen([py, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception as e:
-                        result = {"ok": False, "msg": f"Error validating case: {str(e)[:100]}"}
-                else:
-                    result = {"ok": False, "msg": f"FTS Case {case_num} already tracked"}
-
-            elif action == "remove" and case_num:
-                if case_num in fts_tracked:
-                    fts_tracked.remove(case_num)
-                    cfg["fts_tracked_cases"] = fts_tracked
-                    _save_config(cfg)
-                    result = {"ok": True, "msg": f"FTS Case {case_num} removed from tracking", "fts_tracked": fts_tracked}
-                    _watchdog_log(f"✓ FTS Case {case_num} removed from tracking list")
-                else:
-                    result = {"ok": False, "msg": f"FTS Case {case_num} not in tracking list"}
-
-            elif action == "list":
-                result = {"ok": True, "fts_tracked": cfg.get("fts_tracked_cases", [])}
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
-            return
-
-        if self.path == "/api/tracked-cases":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode() if length else ""
-            try:
-                req = json.loads(body)
-            except Exception:
-                req = {}
-
-            action = req.get("action", "")
-            case_num = req.get("case", "").strip()
-
-            cfg = _read_config()
-            tracked = cfg.get("tracked_cases", [])
-            result = {"ok": False, "msg": "unknown action"}
-
-            if action == "add" and case_num:
-                if case_num not in tracked:
-                    # Validate case exists in Salesforce database
-                    try:
-                        import sqlite3
-                        db = sqlite3.connect(os.path.expanduser("~/.local/state/sf-notification-center.db"))
-                        db.row_factory = sqlite3.Row
-                        case_exists = db.execute(
-                            "SELECT case_id FROM cases WHERE case_number=?", (case_num,)
-                        ).fetchone()
-                        db.close()
-
-                        if not case_exists:
-                            result = {"ok": False, "msg": f"Case {case_num} not found in Salesforce. Please enter a valid case number."}
-                        else:
-                            tracked.append(case_num)
-                            cfg["tracked_cases"] = tracked
-                            _save_config(cfg)
-                            result = {"ok": True, "msg": f"Case {case_num} added for tracking", "tracked": tracked}
-                            _watchdog_log(f"✓ Case {case_num} added to tracking list")
-                            # Trigger immediate poll
-                            py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()
-                            subprocess.Popen([py, os.path.expanduser("~/.local/bin/sf-case-poller"), "--once"],
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception as e:
-                        result = {"ok": False, "msg": f"Error validating case: {str(e)[:100]}"}
-                else:
-                    result = {"ok": False, "msg": f"Case {case_num} already tracked"}
-
-            elif action == "remove" and case_num:
-                if case_num in tracked:
-                    tracked.remove(case_num)
-                    cfg["tracked_cases"] = tracked
-                    _save_config(cfg)
-                    result = {"ok": True, "msg": f"Case {case_num} removed from tracking", "tracked": tracked}
-                    _watchdog_log(f"✓ Case {case_num} removed from tracking list")
-                else:
-                    result = {"ok": False, "msg": f"Case {case_num} not in tracking list"}
-
-            elif action == "list":
-                result = {"ok": True, "tracked": cfg.get("tracked_cases", [])}
-
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
